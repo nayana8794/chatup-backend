@@ -10,6 +10,8 @@ from app.api.v1.members import router as members_router
 from app.api.v1.admin import router as admin_router
 from app.api.v1.meeting_minutes import router as mom_router
 from app.api.v1.chat import router as chat_router
+from app.api.v1.events import router as events_router
+from app.api.v1.financial import router as financial_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -36,6 +38,8 @@ app.include_router(members_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
 app.include_router(mom_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
+app.include_router(events_router, prefix="/api/v1")
+app.include_router(financial_router, prefix="/api/v1")
 
 @app.get("/")
 def read_root():

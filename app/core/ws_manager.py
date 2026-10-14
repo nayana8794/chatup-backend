@@ -7,7 +7,7 @@ class ConnectionManager:
     def __init__(self):
         # Room-level active WebSockets: { room_id: Set[WebSocket] }
         self.active_rooms: Dict[str, Set[WebSocket]] = {}
-        # Tenant-level active WebSockets: { tenant_id: Set[WebSocket] }
+        # Tenant-level active WebSockets for global notifications: { tenant_id: Set[WebSocket] }
         self.active_tenants: Dict[str, Set[WebSocket]] = {}
         # Real-time Document Locks: { minute_id: dict }
         self.mom_locks: Dict[str, dict] = {}
@@ -15,44 +15,52 @@ class ConnectionManager:
     # Room connections
     async def connect_room(self, room_id: str, websocket: WebSocket):
         await websocket.accept()
-        if room_id not in self.active_rooms:
-            self.active_rooms[room_id] = set()
-        self.active_rooms[room_id].add(websocket)
+        r_key = str(room_id).lower()
+        if r_key not in self.active_rooms:
+            self.active_rooms[r_key] = set()
+        self.active_rooms[r_key].add(websocket)
 
     def disconnect_room(self, room_id: str, websocket: WebSocket):
-        if room_id in self.active_rooms:
-            self.active_rooms[room_id].discard(websocket)
-            if not self.active_rooms[room_id]:
-                del self.active_rooms[room_id]
+        r_key = str(room_id).lower()
+        if r_key in self.active_rooms:
+            self.active_rooms[r_key].discard(websocket)
+            if not self.active_rooms[r_key]:
+                del self.active_rooms[r_key]
 
     async def broadcast_to_room(self, room_id: str, message_data: dict):
-        if room_id in self.active_rooms:
-            for connection in list(self.active_rooms[room_id]):
+        r_key = str(room_id).lower()
+        if r_key in self.active_rooms:
+            for connection in list(self.active_rooms[r_key]):
                 try:
                     await connection.send_json(message_data)
                 except Exception:
-                    self.disconnect_room(room_id, connection)
+                    self.disconnect_room(r_key, connection)
 
     # Tenant-level global connections
     async def connect_tenant(self, tenant_id: str, websocket: WebSocket):
         await websocket.accept()
-        if tenant_id not in self.active_tenants:
-            self.active_tenants[tenant_id] = set()
-        self.active_tenants[tenant_id].add(websocket)
+        t_key = str(tenant_id).lower()
+        if t_key not in self.active_tenants:
+            self.active_tenants[t_key] = set()
+        self.active_tenants[t_key].add(websocket)
 
     def disconnect_tenant(self, tenant_id: str, websocket: WebSocket):
-        if tenant_id in self.active_tenants:
-            self.active_tenants[tenant_id].discard(websocket)
-            if not self.active_tenants[tenant_id]:
-                del self.active_tenants[tenant_id]
+        t_key = str(tenant_id).lower()
+        if t_key in self.active_tenants:
+            self.active_tenants[t_key].discard(websocket)
+            if not self.active_tenants[t_key]:
+                del self.active_tenants[t_key]
 
     async def broadcast_to_tenant(self, tenant_id: str, event_data: dict):
-        if tenant_id in self.active_tenants:
-            for connection in list(self.active_tenants[tenant_id]):
-                try:
-                    await connection.send_json(event_data)
-                except Exception:
-                    self.disconnect_tenant(tenant_id, connection)
+        t_key = str(tenant_id).lower()
+        # Case-insensitive robust matching
+        for active_t, conns in list(self.active_tenants.items()):
+            if active_t.lower() == t_key:
+                for connection in list(conns):
+                    try:
+                        await connection.send_json(event_data)
+                    except Exception:
+                        self.disconnect_tenant(active_t, connection)
 
     # Real-time MOM Document Lock Engine
     def acquire_mom_lock(
@@ -61,9 +69,7 @@ class ConnectionManager:
         now = datetime.utcnow()
         current_lock = self.mom_locks.get(minute_id)
 
-        # Lock එකක් පවතී නම් සහ එය තවමත් වලංගු නම් (විනාඩි 1කට අඩු)
         if current_lock and current_lock["expires_at"] > now:
-            # එම පරිශීලකයාම නැවත විවෘත කරන්නේ නම් හෝ President විසින් Take Over කරන්නේ නම්
             if current_lock["user_id"] == user_id or force:
                 self.mom_locks[minute_id] = {
                     "minute_id": minute_id,
@@ -74,10 +80,8 @@ class ConnectionManager:
                     "expires_at": now + timedelta(seconds=60),
                 }
                 return True, self.mom_locks[minute_id]
-            # වෙනත් කෙනෙකු සංස්කරණය කරමින් සිටී නම් Lock එක ප්‍රතික්ෂේප කිරීම
             return False, current_lock
 
-        # Lock එකක් නැතිනම් හෝ Expire වී ඇත්නම් අලුතින් Lock කිරීම
         self.mom_locks[minute_id] = {
             "minute_id": minute_id,
             "user_id": user_id,
