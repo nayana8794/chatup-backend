@@ -7,11 +7,25 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
 from app.core.config import settings
-from app.core.database import Base
-import app.models  # Import all models so Alembic can detect them
+from app.models.tenant import Base
+import app.models  # noqa
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+# Clean up any unsupported query parameters from url for asyncpg
+db_url = settings.DATABASE_URL
+if "?" in db_url:
+    base_url, query = db_url.split("?", 1)
+    # Filter out channel_binding and sslmode
+    params = [p for p in query.split("&") if not p.startswith("sslmode=") and not p.startswith("channel_binding=")]
+    db_url = base_url + ("?" + "&".join(params) if params else "")
+
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+elif db_url.startswith("postgresql://") and not db_url.startswith("postgresql+asyncpg://"):
+    db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+config.set_main_option("sqlalchemy.url", db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -19,9 +33,8 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=db_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -35,11 +48,16 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 async def run_async_migrations() -> None:
+    configuration = config.get_section(config.config_ini_section, {})
+    configuration["sqlalchemy.url"] = db_url
+
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"ssl": "require"} if "neon.tech" in db_url else {}
     )
+
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()

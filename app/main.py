@@ -1,4 +1,5 @@
 # chatup/backend/app/main.py
+import os
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,7 @@ from app.api.v1.meeting_minutes import router as mom_router
 from app.api.v1.chat import router as chat_router
 from app.api.v1.events import router as events_router
 from app.api.v1.financial import router as financial_router
+from app.api.v1.calling import router as calling_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -19,14 +21,17 @@ app = FastAPI(
     description="SaaS Backend for Community Clubs"
 )
 
+# CORS setup: Allow local development as well as any Vercel production deployment
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:3000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",  # Automatically allows all Vercel preview and production URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,10 +45,11 @@ app.include_router(mom_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(events_router, prefix="/api/v1")
 app.include_router(financial_router, prefix="/api/v1")
+app.include_router(calling_router, prefix="/api/v1")
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to ChatUp API Platform"}
+    return {"message": "Welcome to ChatUp API Platform (Live on Cloud)"}
 
 @app.get("/health/db")
 async def check_db_health(db: AsyncSession = Depends(get_db)):

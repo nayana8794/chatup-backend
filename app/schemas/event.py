@@ -27,6 +27,7 @@ class EventUpdateRequest(BaseModel):
 
 class SetRSVPRequest(BaseModel):
     status: RSVPStatus
+    is_virtual_attending: Optional[bool] = False
 
 class AttendeeInfo(BaseModel):
     user_id: uuid.UUID

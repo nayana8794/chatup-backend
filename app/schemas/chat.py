@@ -1,4 +1,5 @@
 # chatup/backend/app/schemas/chat.py
+from app.models import RSVPStatus
 import uuid
 from typing import Optional, List
 from datetime import datetime
@@ -27,3 +28,7 @@ class ChatRoomResponse(BaseModel):
 
 class CreateDirectChatRequest(BaseModel):
     target_user_id: uuid.UUID
+
+class SetRSVPRequest(BaseModel):
+    status: RSVPStatus
+    is_virtual_attending: Optional[bool] = False
