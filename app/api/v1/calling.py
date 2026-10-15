@@ -28,6 +28,16 @@ class DeclineCallRequest(BaseModel):
     caller_id: uuid.UUID
 
 # 1. Endpoint to initiate a call (Rings the receiver's screen in real time)
+CALL_HOST_ROLES = [
+    "SUPER_ADMIN",
+    "PRESIDENT",
+    "VICE_PRESIDENT",
+    "SECRETARY",
+    "VICE_SECRETARY",
+    "PLANNER",
+    "VICE_PLANNER",
+]
+
 @router.post("/initiate")
 async def initiate_call(
     req: InitiateCallRequest,
@@ -37,9 +47,15 @@ async def initiate_call(
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User does not belong to a club")
 
+    # Group Call එකක් නම් නිලධාරීන්ට පමණක් අවසර දීම
+    if not req.target_user_id and current_user.role.value not in CALL_HOST_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Only President, Secretary, or Planner can initiate club conference meetings",
+        )
+
     tenant_id_str = str(current_user.tenant_id).lower()
 
-    # If it's a 1-on-1 direct call
     target_user_name = None
     if req.target_user_id:
         target_user = (await db.execute(select(User).where(User.id == req.target_user_id))).scalar_one_or_none()
@@ -47,7 +63,6 @@ async def initiate_call(
             raise HTTPException(status_code=404, detail="Target user not found")
         target_user_name = target_user.full_name
 
-    # Broadcast incoming call ring event to club members
     payload = {
         "type": "INCOMING_CALL",
         "room_id": req.room_id,
