@@ -30,7 +30,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_origin_regex=r"https://.*\.vercel\.app",  # Automatically allows all Vercel preview and production URLs
     allow_credentials=True,
     allow_methods=["*"],
@@ -46,6 +46,7 @@ app.include_router(chat_router, prefix="/api/v1")
 app.include_router(events_router, prefix="/api/v1")
 app.include_router(financial_router, prefix="/api/v1")
 app.include_router(calling_router, prefix="/api/v1")
+
 
 @app.get("/")
 def read_root():
