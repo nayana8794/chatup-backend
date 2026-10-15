@@ -1,17 +1,22 @@
 # chatup/backend/app/api/v1/calling.py
 import uuid
-from typing import Optional
+from typing import Dict, Set, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+import jwt
 
-from app.core.database import get_db
+from app.core.database import get_db, AsyncSessionLocal
 from app.core.deps import get_current_user
+from app.core.security import SECRET_KEY, ALGORITHM
 from app.core.ws_manager import manager
 from app.models.user import User
 
 router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
+
+# WebRTC Room Connection Tracker: { room_id: Set[WebSocket] }
+call_rooms: Dict[str, Set[WebSocket]] = {}
 
 # Only authorized club leaders can initiate group conference
 CALL_HOST_ROLES = [
@@ -89,3 +94,73 @@ async def decline_call(
             },
         )
     return {"status": "declined"}
+
+# ================= WEBRTC LIVE SIGNALING WEBSOCKET =================
+@router.websocket("/ws/{room_id}")
+async def webrtc_signaling_endpoint(
+    websocket: WebSocket,
+    room_id: str,
+    token: str = Query(...),
+):
+    try:
+        payload_data = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = uuid.UUID(payload_data.get("sub"))
+    except Exception:
+        await websocket.close(code=1008)
+        return
+
+    async with AsyncSessionLocal() as db:
+        user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+        if not user:
+            await websocket.close(code=1008)
+            return
+        user_name = user.full_name
+        user_role = user.role.value
+
+    await websocket.accept()
+
+    r_key = str(room_id).lower()
+    if r_key not in call_rooms:
+        call_rooms[r_key] = set()
+    call_rooms[r_key].add(websocket)
+
+    # Notify others that this user joined the room
+    for conn in list(call_rooms[r_key]):
+        if conn != websocket:
+            try:
+                await conn.send_json({
+                    "type": "peer-joined",
+                    "peer_id": str(user_id),
+                    "peer_name": user_name,
+                    "peer_role": user_role,
+                })
+            except Exception:
+                pass
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            # Forward WebRTC signaling (offer, answer, candidate) to all other peers in room
+            for conn in list(call_rooms[r_key]):
+                if conn != websocket:
+                    try:
+                        await conn.send_json(data)
+                    except Exception:
+                        pass
+    except WebSocketDisconnect:
+        if r_key in call_rooms:
+            call_rooms[r_key].discard(websocket)
+            if not call_rooms[r_key]:
+                del call_rooms[r_key]
+
+        # Notify others that this user left
+        if r_key in call_rooms:
+            for conn in list(call_rooms[r_key]):
+                try:
+                    await conn.send_json({
+                        "type": "peer-left",
+                        "peer_id": str(user_id),
+                        "peer_name": user_name,
+                    })
+                except Exception:
+                    pass
