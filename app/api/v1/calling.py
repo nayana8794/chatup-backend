@@ -147,7 +147,7 @@ async def webrtc_signaling_endpoint(
                         await conn.send_json(data)
                     except Exception:
                         pass
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, Exception):
         if r_key in call_rooms:
             call_rooms[r_key].discard(websocket)
             if not call_rooms[r_key]:

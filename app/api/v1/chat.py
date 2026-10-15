@@ -200,6 +200,57 @@ async def get_room_messages(
         for msg, name, role in messages
     ]
 
+class SendMessageRequest(BaseModel):
+    content: str
+
+@router.post("/rooms/{room_id}/messages", response_model=MessageResponse)
+async def send_room_message(
+    room_id: uuid.UUID,
+    req: SendMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message content cannot be empty")
+
+    now = datetime.utcnow()
+    msg = ChatMessage(
+        room_id=room_id,
+        sender_id=current_user.id,
+        content=content,
+        created_at=now,
+    )
+    db.add(msg)
+    await db.commit()
+    await db.refresh(msg)
+
+    payload = {
+        "type": "NEW_CHAT_MESSAGE",
+        "id": str(msg.id),
+        "room_id": str(msg.room_id),
+        "sender_id": str(current_user.id),
+        "sender_name": current_user.full_name,
+        "sender_role": current_user.role.value,
+        "content": msg.content,
+        "created_at": msg.created_at.isoformat(),
+    }
+
+    # Broadcast to room members & tenant
+    await manager.broadcast_to_room(str(room_id), payload)
+    if current_user.tenant_id:
+        await manager.broadcast_to_tenant(str(current_user.tenant_id), payload)
+
+    return MessageResponse(
+        id=msg.id,
+        room_id=msg.room_id,
+        sender_id=msg.sender_id,
+        sender_name=current_user.full_name,
+        sender_role=current_user.role.value,
+        content=msg.content,
+        created_at=msg.created_at,
+    )
+
 @router.post("/direct", response_model=ChatRoomResponse)
 async def get_or_create_direct_chat(
     req: CreateDirectChatRequest,
