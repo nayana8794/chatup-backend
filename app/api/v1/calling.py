@@ -15,8 +15,8 @@ from app.models.user import User
 
 router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
 
-# WebRTC Room Connection Tracker: { room_id: Set[WebSocket] }
-call_rooms: Dict[str, Set[WebSocket]] = {}
+# WebRTC Room Connection Tracker: { room_id: {websocket: user_info} }
+call_rooms: Dict[str, Dict[WebSocket, dict]] = {}
 
 # Only authorized club leaders can initiate group conference
 CALL_HOST_ROLES = [
@@ -29,14 +29,17 @@ CALL_HOST_ROLES = [
     "VICE_PLANNER",
 ]
 
+
 class InitiateCallRequest(BaseModel):
     room_id: str
     call_type: str = "video"
     target_user_id: Optional[uuid.UUID] = None
 
+
 class DeclineCallRequest(BaseModel):
     room_id: str
     caller_id: uuid.UUID
+
 
 @router.post("/initiate")
 async def initiate_call(
@@ -58,7 +61,9 @@ async def initiate_call(
 
     target_user_name = None
     if req.target_user_id:
-        target_user = (await db.execute(select(User).where(User.id == req.target_user_id))).scalar_one_or_none()
+        target_user = (
+            await db.execute(select(User).where(User.id == req.target_user_id))
+        ).scalar_one_or_none()
         if not target_user:
             raise HTTPException(status_code=404, detail="Target user not found")
         target_user_name = target_user.full_name
@@ -79,6 +84,7 @@ async def initiate_call(
     await manager.broadcast_to_tenant(tenant_id_str, payload)
     return {"status": "ringing", "room_id": req.room_id}
 
+
 @router.post("/decline")
 async def decline_call(
     req: DeclineCallRequest,
@@ -95,6 +101,7 @@ async def decline_call(
         )
     return {"status": "declined"}
 
+
 # ================= WEBRTC LIVE SIGNALING WEBSOCKET =================
 @router.websocket("/ws/{room_id}")
 async def webrtc_signaling_endpoint(
@@ -102,6 +109,7 @@ async def webrtc_signaling_endpoint(
     room_id: str,
     token: str = Query(...),
 ):
+    # ── Authenticate the connecting user ──────────────────────────────────────
     try:
         payload_data = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = uuid.UUID(payload_data.get("sub"))
@@ -110,7 +118,9 @@ async def webrtc_signaling_endpoint(
         return
 
     async with AsyncSessionLocal() as db:
-        user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+        user = (
+            await db.execute(select(User).where(User.id == user_id))
+        ).scalar_one_or_none()
         if not user:
             await websocket.close(code=1008)
             return
@@ -121,11 +131,17 @@ async def webrtc_signaling_endpoint(
 
     r_key = str(room_id).lower()
     if r_key not in call_rooms:
-        call_rooms[r_key] = set()
-    call_rooms[r_key].add(websocket)
+        call_rooms[r_key] = {}
 
-    # Notify others that this user joined the room
-    for conn in list(call_rooms[r_key]):
+    call_rooms[r_key][websocket] = {
+        "user_id": str(user_id),
+        "user_name": user_name,
+        "user_role": user_role,
+    }
+
+    # ── Notify existing peers that a new person joined ────────────────────────
+    # The existing peer (initiator) will send an SDP offer upon receiving "peer-joined".
+    for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
                 await conn.send_json({
@@ -137,25 +153,28 @@ async def webrtc_signaling_endpoint(
             except Exception:
                 pass
 
+    # ── Relay loop: forward every WebRTC message to all other peers ───────────
     try:
         while True:
             data = await websocket.receive_json()
-            # Forward WebRTC signaling (offer, answer, candidate) to all other peers in room
-            for conn in list(call_rooms[r_key]):
+            for conn in list(call_rooms[r_key].keys()):
                 if conn != websocket:
                     try:
                         await conn.send_json(data)
                     except Exception:
                         pass
     except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        # ── Clean up ──────────────────────────────────────────────────────────
         if r_key in call_rooms:
-            call_rooms[r_key].discard(websocket)
+            call_rooms[r_key].pop(websocket, None)
             if not call_rooms[r_key]:
                 del call_rooms[r_key]
 
-        # Notify others that this user left
+        # Notify remaining peers that this peer left
         if r_key in call_rooms:
-            for conn in list(call_rooms[r_key]):
+            for conn in list(call_rooms[r_key].keys()):
                 try:
                     await conn.send_json({
                         "type": "peer-left",
