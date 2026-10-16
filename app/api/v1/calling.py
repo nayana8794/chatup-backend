@@ -140,7 +140,6 @@ async def webrtc_signaling_endpoint(
     }
 
     # ── Notify existing peers that a new person joined ────────────────────────
-    # The existing peer (initiator) will send an SDP offer upon receiving "peer-joined".
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
@@ -157,6 +156,31 @@ async def webrtc_signaling_endpoint(
     try:
         while True:
             data = await websocket.receive_json()
+            msg_type = data.get("type")
+
+            # Handle host control actions (Mute / Kick participant)
+            if msg_type == "host-mute-peer":
+                target_peer_id = data.get("target_peer_id")
+                for conn, info in list(call_rooms[r_key].items()):
+                    if info["user_id"] == target_peer_id:
+                        try:
+                            await conn.send_json({"type": "force-mute"})
+                        except Exception:
+                            pass
+                continue
+
+            if msg_type == "host-kick-peer":
+                target_peer_id = data.get("target_peer_id")
+                for conn, info in list(call_rooms[r_key].items()):
+                    if info["user_id"] == target_peer_id:
+                        try:
+                            await conn.send_json({"type": "force-kick"})
+                            await conn.close()
+                        except Exception:
+                            pass
+                continue
+
+            # Standard WebRTC signaling relay (offer, answer, candidate, hand-raise, emoji)
             for conn in list(call_rooms[r_key].keys()):
                 if conn != websocket:
                     try:
