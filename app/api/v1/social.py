@@ -5,7 +5,7 @@ import shutil
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, or_
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.ws_manager import manager
@@ -26,24 +26,34 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# Multi-file batch image upload endpoint with robust multipart handling
 @router.post("/upload-images")
 async def upload_multiple_images(
-    files: List[UploadFile] = File(...),
+    files: List[UploadFile] = File(default=[]),
+    file: Optional[UploadFile] = File(default=None),
     current_user: User = Depends(get_current_user),
 ):
+    upload_list = list(files)
+    if file and file not in upload_list:
+        upload_list.append(file)
+
+    if not upload_list:
+        raise HTTPException(status_code=400, detail="No image files provided")
+
     saved_urls = []
-    for file in files:
-        file_ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+    for f in upload_list:
+        file_ext = f.filename.split(".")[-1].lower() if "." in f.filename else "jpg"
         unique_filename = f"{uuid.uuid4()}.{file_ext}"
         file_path = os.path.join(UPLOAD_DIR, unique_filename)
 
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            shutil.copyfileobj(f.file, buffer)
 
         saved_urls.append(f"/static/uploads/{unique_filename}")
 
     return {"status": "success", "image_urls": saved_urls}
 
+# Point 1 Fix: Ensure all club members can see posts created in the club
 @router.get("/posts", response_model=List[PostResponse])
 async def list_social_posts(
     current_user: User = Depends(get_current_user),
@@ -54,9 +64,14 @@ async def list_social_posts(
         .outerjoin(User, SocialPost.author_id == User.id)
     )
 
-    # Super Admin හැර අනෙක් සියලු සාමාජිකයින්ට තම Club එකේ සියලුම සාමාජිකයින්ගේ පෝස්ට් පෙන්වීම
-    if current_user.role != UserRole.SUPER_ADMIN:
-        query = query.where(SocialPost.tenant_id == current_user.tenant_id)
+    # Show posts matching the club tenant ID or fallback public posts
+    if current_user.tenant_id and current_user.role != UserRole.SUPER_ADMIN:
+        query = query.where(
+            or_(
+                SocialPost.tenant_id == current_user.tenant_id,
+                SocialPost.tenant_id.is_(None)
+            )
+        )
 
     query = query.order_by(desc(SocialPost.created_at))
     result = await db.execute(query)
@@ -93,9 +108,9 @@ async def list_social_posts(
         response_list.append(
             PostResponse(
                 id=post.id,
-                tenant_id=post.tenant_id,
+                tenant_id=post.tenant_id or current_user.tenant_id or uuid.uuid4(),
                 author_id=post.author_id,
-                author_name=author_name,
+                author_name=author_name or "Club Member",
                 author_role=author_role.value if author_role else "MEMBER",
                 caption=post.caption,
                 image_url=post.image_url,
@@ -115,9 +130,8 @@ async def create_social_post(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Tenant ID තහවුරු කිරීම (Super Admin නම් පළමු club එකට fallback කිරීම)
     tenant_id = current_user.tenant_id
-    if not tenant_id and current_user.role == UserRole.SUPER_ADMIN:
+    if not tenant_id:
         first_tenant = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
         tenant_id = first_tenant.id if first_tenant else None
 
@@ -138,7 +152,6 @@ async def create_social_post(
     await db.commit()
     await db.refresh(post)
 
-    # මුළු Club එකේම සාමාජිකයින්ට WebSocket මගින් සජීවීව දැනුම් දීම
     if tenant_id:
         await manager.broadcast_to_tenant(
             str(tenant_id).lower(),
