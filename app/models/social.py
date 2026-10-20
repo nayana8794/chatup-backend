@@ -1,8 +1,8 @@
 # chatup/backend/app/models/social.py
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Text, DateTime, ForeignKey, Integer
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Column, String, Text, DateTime, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -14,7 +14,8 @@ class SocialPost(Base):
     author_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     caption = Column(Text, nullable=False)
-    image_url = Column(String(500), nullable=True)
+    image_url = Column(String(500), nullable=True)  # Backward compatibility
+    image_urls = Column(JSONB, default=list, server_default='[]', nullable=True)  # Facebook-style multi-image list
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -46,4 +47,4 @@ class PostComment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     post = relationship("SocialPost", back_populates="comments")
-    user = relationship("User") 
+    user = relationship("User")

@@ -1,10 +1,9 @@
 # chatup/backend/app/api/v1/social.py
-import uuid
 import os
+import uuid
 import shutil
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
-from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from app.core.database import get_db
@@ -12,38 +11,38 @@ from app.core.deps import get_current_user
 from app.core.ws_manager import manager
 from app.models.social import SocialPost, PostLike, PostComment
 from app.models.user import User, UserRole
-from app.schemas.social import PostCreateRequest, PostResponse, CommentCreate, CommentResponse
+from app.schemas.social import (
+    PostCreateRequest,
+    PostUpdateRequest,
+    PostResponse,
+    CommentCreate,
+    CommentResponse,
+)
 
 router = APIRouter(prefix="/social", tags=["Club Social Wall"])
 
-# Absolute path resolution ensuring uploaded photos match the static mount
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-class PostUpdateRequest(BaseModel):
-    caption: str
-    image_url: Optional[str] = None
-
-@router.post("/upload-image")
-async def upload_social_image(
-    file: UploadFile = File(...),
+# Multi-file batch image upload endpoint
+@router.post("/upload-images")
+async def upload_multiple_images(
+    files: List[UploadFile] = File(...),
     current_user: User = Depends(get_current_user),
 ):
-    file_ext = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    saved_urls = []
+    for file in files:
+        file_ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+        unique_filename = f"{uuid.uuid4()}.{file_ext}"
+        file_path = os.path.join(UPLOAD_DIR, unique_filename)
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    # Returns public relative path matching app.mount('/static', ...)
-    image_url = f"/static/uploads/{unique_filename}"
-    return {"status": "success", "image_url": image_url}
+        saved_urls.append(f"/static/uploads/{unique_filename}")
 
-class PostUpdateRequest(BaseModel):
-    caption: str
-    image_url: Optional[str] = None
+    return {"status": "success", "image_urls": saved_urls}
 
 @router.get("/posts", response_model=List[PostResponse])
 async def list_social_posts(
@@ -83,6 +82,11 @@ async def list_social_posts(
             for c, c_name in comments_res.all()
         ]
 
+        # Combine image_urls and legacy image_url seamlessly
+        combined_images = list(post.image_urls or [])
+        if post.image_url and post.image_url not in combined_images:
+            combined_images.insert(0, post.image_url)
+
         response_list.append(
             PostResponse(
                 id=post.id,
@@ -92,6 +96,7 @@ async def list_social_posts(
                 author_role=author_role.value if author_role else "MEMBER",
                 caption=post.caption,
                 image_url=post.image_url,
+                image_urls=combined_images,
                 created_at=post.created_at,
                 likes_count=likes_count,
                 is_liked_by_me=is_liked_by_me,
@@ -107,11 +112,18 @@ async def create_social_post(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    all_imgs = list(req.image_urls or [])
+    if req.image_url and req.image_url not in all_imgs:
+        all_imgs.insert(0, req.image_url)
+
+    first_img = all_imgs[0] if all_imgs else None
+
     post = SocialPost(
         tenant_id=current_user.tenant_id,
         author_id=current_user.id,
         caption=req.caption,
-        image_url=req.image_url,
+        image_url=first_img,
+        image_urls=all_imgs,
     )
     db.add(post)
     await db.commit()
@@ -131,6 +143,7 @@ async def create_social_post(
         author_role=current_user.role.value,
         caption=post.caption,
         image_url=post.image_url,
+        image_urls=post.image_urls or [],
         created_at=post.created_at,
         likes_count=0,
         is_liked_by_me=False,
@@ -148,12 +161,14 @@ async def update_social_post(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    # Only author or President/Super Admin can update
     if post.author_id != current_user.id and current_user.role not in [UserRole.SUPER_ADMIN, UserRole.PRESIDENT]:
         raise HTTPException(status_code=403, detail="Permission denied to edit this post")
 
+    all_imgs = list(req.image_urls or [])
     post.caption = req.caption
-    post.image_url = req.image_url
+    post.image_urls = all_imgs
+    post.image_url = all_imgs[0] if all_imgs else None
+
     await db.commit()
     await db.refresh(post)
 
@@ -171,6 +186,7 @@ async def update_social_post(
         author_role=current_user.role.value,
         caption=post.caption,
         image_url=post.image_url,
+        image_urls=post.image_urls or [],
         created_at=post.created_at,
         likes_count=0,
         is_liked_by_me=False,
@@ -260,4 +276,3 @@ async def add_post_comment(
         content=comment.content,
         created_at=comment.created_at,
     )
-

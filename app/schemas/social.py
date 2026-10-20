@@ -20,6 +20,11 @@ class CommentResponse(BaseModel):
 class PostCreateRequest(BaseModel):
     caption: str
     image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = []
+
+class PostUpdateRequest(BaseModel):
+    caption: str
+    image_urls: Optional[List[str]] = []
 
 class PostResponse(BaseModel):
     id: uuid.UUID
@@ -29,6 +34,7 @@ class PostResponse(BaseModel):
     author_role: Optional[str] = None
     caption: str
     image_url: Optional[str] = None
+    image_urls: List[str] = []
     created_at: datetime
     likes_count: int = 0
     is_liked_by_me: bool = False
