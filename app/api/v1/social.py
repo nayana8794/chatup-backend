@@ -9,6 +9,7 @@ from sqlalchemy import select, desc
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.ws_manager import manager
+from app.models.tenant import Tenant
 from app.models.social import SocialPost, PostLike, PostComment
 from app.models.user import User, UserRole
 from app.schemas.social import (
@@ -25,7 +26,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Multi-file batch image upload endpoint
 @router.post("/upload-images")
 async def upload_multiple_images(
     files: List[UploadFile] = File(...),
@@ -52,9 +52,13 @@ async def list_social_posts(
     query = (
         select(SocialPost, User.full_name, User.role)
         .outerjoin(User, SocialPost.author_id == User.id)
-        .where(SocialPost.tenant_id == current_user.tenant_id)
-        .order_by(desc(SocialPost.created_at))
     )
+
+    # Super Admin හැර අනෙක් සියලු සාමාජිකයින්ට තම Club එකේ සියලුම සාමාජිකයින්ගේ පෝස්ට් පෙන්වීම
+    if current_user.role != UserRole.SUPER_ADMIN:
+        query = query.where(SocialPost.tenant_id == current_user.tenant_id)
+
+    query = query.order_by(desc(SocialPost.created_at))
     result = await db.execute(query)
     rows = result.all()
 
@@ -82,7 +86,6 @@ async def list_social_posts(
             for c, c_name in comments_res.all()
         ]
 
-        # Combine image_urls and legacy image_url seamlessly
         combined_images = list(post.image_urls or [])
         if post.image_url and post.image_url not in combined_images:
             combined_images.insert(0, post.image_url)
@@ -112,6 +115,12 @@ async def create_social_post(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Tenant ID තහවුරු කිරීම (Super Admin නම් පළමු club එකට fallback කිරීම)
+    tenant_id = current_user.tenant_id
+    if not tenant_id and current_user.role == UserRole.SUPER_ADMIN:
+        first_tenant = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
+        tenant_id = first_tenant.id if first_tenant else None
+
     all_imgs = list(req.image_urls or [])
     if req.image_url and req.image_url not in all_imgs:
         all_imgs.insert(0, req.image_url)
@@ -119,7 +128,7 @@ async def create_social_post(
     first_img = all_imgs[0] if all_imgs else None
 
     post = SocialPost(
-        tenant_id=current_user.tenant_id,
+        tenant_id=tenant_id,
         author_id=current_user.id,
         caption=req.caption,
         image_url=first_img,
@@ -129,9 +138,10 @@ async def create_social_post(
     await db.commit()
     await db.refresh(post)
 
-    if current_user.tenant_id:
+    # මුළු Club එකේම සාමාජිකයින්ට WebSocket මගින් සජීවීව දැනුම් දීම
+    if tenant_id:
         await manager.broadcast_to_tenant(
-            str(current_user.tenant_id).lower(),
+            str(tenant_id).lower(),
             {"type": "SOCIAL_POST_CREATED", "post_id": str(post.id)},
         )
 
@@ -172,9 +182,9 @@ async def update_social_post(
     await db.commit()
     await db.refresh(post)
 
-    if current_user.tenant_id:
+    if post.tenant_id:
         await manager.broadcast_to_tenant(
-            str(current_user.tenant_id).lower(),
+            str(post.tenant_id).lower(),
             {"type": "SOCIAL_POST_UPDATED", "post_id": str(post.id)},
         )
 
@@ -224,6 +234,10 @@ async def toggle_post_like(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    post = (await db.execute(select(SocialPost).where(SocialPost.id == post_id))).scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
     existing = (
         await db.execute(
             select(PostLike).where(PostLike.post_id == post_id, PostLike.user_id == current_user.id)
@@ -239,10 +253,10 @@ async def toggle_post_like(
 
     await db.commit()
 
-    if current_user.tenant_id:
+    if post.tenant_id:
         await manager.broadcast_to_tenant(
-            str(current_user.tenant_id).lower(),
-            {"type": "SOCIAL_POST_LIKED", "post_id": str(post_id)},
+            str(post.tenant_id).lower(),
+            {"type": "SOCIAL_POST_LIKED", "post_id": str(post.id)},
         )
 
     return {"status": "success", "liked": liked}
@@ -254,6 +268,10 @@ async def add_post_comment(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    post = (await db.execute(select(SocialPost).where(SocialPost.id == post_id))).scalar_one_or_none()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
     comment = PostComment(
         post_id=post_id,
         user_id=current_user.id,
@@ -263,10 +281,10 @@ async def add_post_comment(
     await db.commit()
     await db.refresh(comment)
 
-    if current_user.tenant_id:
+    if post.tenant_id:
         await manager.broadcast_to_tenant(
-            str(current_user.tenant_id).lower(),
-            {"type": "SOCIAL_POST_COMMENTED", "post_id": str(post_id)},
+            str(post.tenant_id).lower(),
+            {"type": "SOCIAL_POST_COMMENTED", "post_id": str(post.id)},
         )
 
     return CommentResponse(
