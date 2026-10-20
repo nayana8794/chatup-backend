@@ -15,8 +15,31 @@ from app.models.user import User, UserRole
 from app.schemas.social import PostCreateRequest, PostResponse, CommentCreate, CommentResponse
 
 router = APIRouter(prefix="/social", tags=["Club Social Wall"])
-UPLOAD_DIR = "app/static/uploads"
+
+# Absolute path resolution ensuring uploaded photos match the static mount
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+class PostUpdateRequest(BaseModel):
+    caption: str
+    image_url: Optional[str] = None
+
+@router.post("/upload-image")
+async def upload_social_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    file_ext = file.filename.split(".")[-1]
+    unique_filename = f"{uuid.uuid4()}.{file_ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Returns public relative path matching app.mount('/static', ...)
+    image_url = f"/static/uploads/{unique_filename}"
+    return {"status": "success", "image_url": image_url}
 
 class PostUpdateRequest(BaseModel):
     caption: str
@@ -238,18 +261,3 @@ async def add_post_comment(
         created_at=comment.created_at,
     )
 
-@router.post("/upload-image")
-async def upload_social_image(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-):
-    file_ext = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Local / Cloud URL එක Return කිරීම
-    image_url = f"/static/uploads/{unique_filename}"
-    return {"status": "success", "image_url": image_url}

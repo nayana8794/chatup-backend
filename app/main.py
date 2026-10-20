@@ -2,6 +2,7 @@
 import os
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from app.core.database import get_db
@@ -15,7 +16,6 @@ from app.api.v1.events import router as events_router
 from app.api.v1.financial import router as financial_router
 from app.api.v1.calling import router as calling_router
 from app.api.v1.social import router as social_router
-from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -23,7 +23,7 @@ app = FastAPI(
     description="SaaS Backend for Community Clubs"
 )
 
-# CORS setup: Allow local development as well as any Vercel production deployment
+# CORS configuration
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -33,11 +33,17 @@ origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_origin_regex=r"https://.*\.vercel\.app",  # Automatically allows all Vercel preview and production URLs
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Static files mounting to serve uploaded photos publicly
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+os.makedirs(os.path.join(STATIC_DIR, "uploads"), exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Include All Routers
 app.include_router(auth_router, prefix="/api/v1")
@@ -49,8 +55,6 @@ app.include_router(events_router, prefix="/api/v1")
 app.include_router(financial_router, prefix="/api/v1")
 app.include_router(calling_router, prefix="/api/v1")
 app.include_router(social_router, prefix="/api/v1")
-app.mount("/app/static", StaticFiles(directory="app/static"), name="static")
-
 
 @app.get("/")
 def read_root():
