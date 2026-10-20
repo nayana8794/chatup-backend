@@ -26,7 +26,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Multi-file batch image upload endpoint with robust multipart handling
+# Safe multi-image upload handling both files array and single file
 @router.post("/upload-images")
 async def upload_multiple_images(
     files: List[UploadFile] = File(default=[]),
@@ -42,18 +42,25 @@ async def upload_multiple_images(
 
     saved_urls = []
     for f in upload_list:
-        file_ext = f.filename.split(".")[-1].lower() if "." in f.filename else "jpg"
-        unique_filename = f"{uuid.uuid4()}.{file_ext}"
-        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+        try:
+            filename = f.filename or "photo.jpg"
+            file_ext = filename.split(".")[-1].lower() if "." in filename else "jpg"
+            unique_filename = f"{uuid.uuid4()}.{file_ext}"
+            file_path = os.path.join(UPLOAD_DIR, unique_filename)
 
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(f.file, buffer)
 
-        saved_urls.append(f"/static/uploads/{unique_filename}")
+            saved_urls.append(f"/static/uploads/{unique_filename}")
+        except Exception:
+            continue
+
+    if not saved_urls:
+        raise HTTPException(status_code=500, detail="Failed to save uploaded photos")
 
     return {"status": "success", "image_urls": saved_urls}
 
-# Point 1 Fix: Ensure all club members can see posts created in the club
+# Point 1 Fix: Ensure all club members can see posts created in the club workspace
 @router.get("/posts", response_model=List[PostResponse])
 async def list_social_posts(
     current_user: User = Depends(get_current_user),
@@ -64,14 +71,17 @@ async def list_social_posts(
         .outerjoin(User, SocialPost.author_id == User.id)
     )
 
-    # Show posts matching the club tenant ID or fallback public posts
-    if current_user.tenant_id and current_user.role != UserRole.SUPER_ADMIN:
-        query = query.where(
-            or_(
-                SocialPost.tenant_id == current_user.tenant_id,
-                SocialPost.tenant_id.is_(None)
-            )
-        )
+    first_tenant_id = (await db.execute(select(Tenant.id).limit(1))).scalar_one_or_none()
+
+    tenant_filter = []
+    if current_user.tenant_id:
+        tenant_filter.append(SocialPost.tenant_id == current_user.tenant_id)
+    if first_tenant_id:
+        tenant_filter.append(SocialPost.tenant_id == first_tenant_id)
+    tenant_filter.append(SocialPost.tenant_id.is_(None))
+
+    if current_user.role != UserRole.SUPER_ADMIN:
+        query = query.where(or_(*tenant_filter))
 
     query = query.order_by(desc(SocialPost.created_at))
     result = await db.execute(query)
@@ -132,8 +142,8 @@ async def create_social_post(
 ):
     tenant_id = current_user.tenant_id
     if not tenant_id:
-        first_tenant = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
-        tenant_id = first_tenant.id if first_tenant else None
+        first_tenant = (await db.execute(select(Tenant.id).limit(1))).scalar_one_or_none()
+        tenant_id = first_tenant
 
     all_imgs = list(req.image_urls or [])
     if req.image_url and req.image_url not in all_imgs:
@@ -152,9 +162,12 @@ async def create_social_post(
     await db.commit()
     await db.refresh(post)
 
-    if tenant_id:
+    # Real-time WebSocket broadcast to all members
+    first_tenant_id = (await db.execute(select(Tenant.id).limit(1))).scalar_one_or_none()
+    broadcast_tenants = {str(t).lower() for t in [tenant_id, first_tenant_id, current_user.tenant_id] if t}
+    for t_id in broadcast_tenants:
         await manager.broadcast_to_tenant(
-            str(tenant_id).lower(),
+            t_id,
             {"type": "SOCIAL_POST_CREATED", "post_id": str(post.id)},
         )
 
