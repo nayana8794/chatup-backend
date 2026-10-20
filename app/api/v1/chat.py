@@ -14,6 +14,7 @@ from app.core.ws_manager import manager
 from app.models.chat import ChatRoom, ChatParticipant, ChatMessage, RoomType, ChatReadReceipt
 from app.models.user import User, UserRole
 from app.schemas.chat import ChatRoomResponse, MessageResponse, CreateDirectChatRequest
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/chat", tags=["Real-time Chat"])
 

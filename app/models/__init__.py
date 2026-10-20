@@ -5,6 +5,7 @@ from app.models.meeting_minute import MeetingMinute, MinuteStatus
 from app.models.chat import ChatRoom, ChatParticipant, ChatMessage, RoomType, ChatReadReceipt
 from app.models.event import Event, EventRSVP, EventType, RSVPStatus
 from app.models.financial import DuesInvoice, ClubTransaction, DuesStatus, TransactionType
+from app.models.social import SocialPost, PostLike, PostComment
 
 __all__ = [
     "Tenant",
@@ -26,4 +27,7 @@ __all__ = [
     "ClubTransaction",
     "DuesStatus",
     "TransactionType",
+    "SocialPost",
+    "PostLike",
+    "PostComment",
 ]
