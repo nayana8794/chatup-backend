@@ -1,7 +1,9 @@
 # chatup/backend/app/api/v1/social.py
 import uuid
+import os
+import shutil
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -13,6 +15,8 @@ from app.models.user import User, UserRole
 from app.schemas.social import PostCreateRequest, PostResponse, CommentCreate, CommentResponse
 
 router = APIRouter(prefix="/social", tags=["Club Social Wall"])
+UPLOAD_DIR = "app/static/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 class PostUpdateRequest(BaseModel):
     caption: str
@@ -233,3 +237,19 @@ async def add_post_comment(
         content=comment.content,
         created_at=comment.created_at,
     )
+
+@router.post("/upload-image")
+async def upload_social_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    file_ext = file.filename.split(".")[-1]
+    unique_filename = f"{uuid.uuid4()}.{file_ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Local / Cloud URL එක Return කිරීම
+    image_url = f"/static/uploads/{unique_filename}"
+    return {"status": "success", "image_url": image_url}
