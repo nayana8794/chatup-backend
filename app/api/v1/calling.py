@@ -1,6 +1,6 @@
 # chatup/backend/app/api/v1/calling.py
 import uuid
-from typing import Dict, Set, Optional
+from typing import Dict, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +39,28 @@ class InitiateCallRequest(BaseModel):
 class DeclineCallRequest(BaseModel):
     room_id: str
     caller_id: Optional[uuid.UUID] = None
+
+
+class EndCallRequest(BaseModel):
+    room_id: str
+
+
+@router.get("/active")
+async def get_active_club_call(
+    current_user: User = Depends(get_current_user),
+):
+    if not current_user.tenant_id:
+        return {"active": False, "room_id": None, "participant_count": 0}
+
+    room_id = f"club-meeting-{str(current_user.tenant_id).lower()}"
+    participants = call_rooms.get(room_id, {})
+    count = len(participants)
+
+    return {
+        "active": count > 0,
+        "room_id": room_id,
+        "participant_count": count,
+    }
 
 
 @router.post("/initiate")
@@ -94,10 +116,33 @@ async def decline_call(
             {
                 "type": "CALL_DECLINED",
                 "room_id": req.room_id,
+                "declined_by_id": str(current_user.id),
                 "declined_by_name": current_user.full_name,
             },
         )
     return {"status": "declined"}
+
+
+@router.post("/end")
+async def end_call(
+    req: EndCallRequest,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.tenant_id:
+        r_key = str(req.room_id).lower()
+        remaining = len(call_rooms.get(r_key, {}))
+        # Broadcast CALL_ENDED if no one is left or if a host/caller cancels the ringing call
+        if remaining <= 1 or current_user.role.value in CALL_HOST_ROLES:
+            await manager.broadcast_to_tenant(
+                str(current_user.tenant_id).lower(),
+                {
+                    "type": "CALL_ENDED",
+                    "room_id": req.room_id,
+                    "ended_by_id": str(current_user.id),
+                    "ended_by_name": current_user.full_name,
+                },
+            )
+    return {"status": "ended"}
 
 
 @router.websocket("/ws/{room_id}")
@@ -122,6 +167,7 @@ async def webrtc_signaling_endpoint(
             return
         user_name = user.full_name
         user_role = user.role.value
+        tenant_id_str = str(user.tenant_id).lower() if user.tenant_id else None
 
     await websocket.accept()
 
@@ -129,12 +175,27 @@ async def webrtc_signaling_endpoint(
     if r_key not in call_rooms:
         call_rooms[r_key] = {}
 
+    # Send existing peers list to the newly joined user so their participant list is accurate
+    for conn, info in list(call_rooms[r_key].items()):
+        if conn != websocket:
+            try:
+                await websocket.send_json({
+                    "type": "existing-peer",
+                    "peer_id": info["user_id"],
+                    "peer_name": info["user_name"],
+                    "peer_role": info["user_role"],
+                })
+            except Exception:
+                pass
+
     call_rooms[r_key][websocket] = {
         "user_id": str(user_id),
         "user_name": user_name,
         "user_role": user_role,
+        "tenant_id": tenant_id_str,
     }
 
+    # Notify existing peers that a new person joined
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
@@ -182,11 +243,14 @@ async def webrtc_signaling_endpoint(
     except (WebSocketDisconnect, Exception):
         pass
     finally:
+        room_became_empty = False
         if r_key in call_rooms:
             call_rooms[r_key].pop(websocket, None)
             if not call_rooms[r_key]:
                 del call_rooms[r_key]
+                room_became_empty = True
 
+        # Notify remaining peers in the room that this peer left
         if r_key in call_rooms:
             for conn in list(call_rooms[r_key].keys()):
                 try:
@@ -197,3 +261,18 @@ async def webrtc_signaling_endpoint(
                     })
                 except Exception:
                     pass
+
+        # CRITICAL FIX: If the room is now empty (e.g. President hung up before or after call),
+        # broadcast CALL_ENDED to the whole tenant so any ringing IncomingCallModal closes immediately!
+        if room_became_empty and tenant_id_str:
+            try:
+                await manager.broadcast_to_tenant(
+                    tenant_id_str,
+                    {
+                        "type": "CALL_ENDED",
+                        "room_id": room_id,
+                        "ended_by_id": str(user_id),
+                    },
+                )
+            except Exception:
+                pass
