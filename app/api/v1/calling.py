@@ -38,7 +38,7 @@ class InitiateCallRequest(BaseModel):
 
 class DeclineCallRequest(BaseModel):
     room_id: str
-    caller_id: uuid.UUID
+    caller_id: Optional[uuid.UUID] = None
 
 
 @router.post("/initiate")
@@ -50,7 +50,6 @@ async def initiate_call(
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User does not belong to a club")
 
-    # If it's a group call, enforce leadership role permissions
     if not req.target_user_id and current_user.role.value not in CALL_HOST_ROLES:
         raise HTTPException(
             status_code=403,
@@ -68,7 +67,6 @@ async def initiate_call(
             raise HTTPException(status_code=404, detail="Target user not found")
         target_user_name = target_user.full_name
 
-    # Broadcast incoming call ring event to all tenant members
     payload = {
         "type": "INCOMING_CALL",
         "room_id": req.room_id,
@@ -102,14 +100,12 @@ async def decline_call(
     return {"status": "declined"}
 
 
-# ================= WEBRTC LIVE SIGNALING WEBSOCKET =================
 @router.websocket("/ws/{room_id}")
 async def webrtc_signaling_endpoint(
     websocket: WebSocket,
     room_id: str,
     token: str = Query(...),
 ):
-    # ── Authenticate the connecting user ──────────────────────────────────────
     try:
         payload_data = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = uuid.UUID(payload_data.get("sub"))
@@ -139,7 +135,6 @@ async def webrtc_signaling_endpoint(
         "user_role": user_role,
     }
 
-    # ── Notify existing peers that a new person joined ────────────────────────
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
@@ -152,13 +147,11 @@ async def webrtc_signaling_endpoint(
             except Exception:
                 pass
 
-    # ── Relay loop: forward every WebRTC message to all other peers ───────────
     try:
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type")
 
-            # Handle host control actions (Mute / Kick participant)
             if msg_type == "host-mute-peer":
                 target_peer_id = data.get("target_peer_id")
                 for conn, info in list(call_rooms[r_key].items()):
@@ -180,7 +173,6 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            # Standard WebRTC signaling relay (offer, answer, candidate, hand-raise, emoji)
             for conn in list(call_rooms[r_key].keys()):
                 if conn != websocket:
                     try:
@@ -190,13 +182,11 @@ async def webrtc_signaling_endpoint(
     except (WebSocketDisconnect, Exception):
         pass
     finally:
-        # ── Clean up ──────────────────────────────────────────────────────────
         if r_key in call_rooms:
             call_rooms[r_key].pop(websocket, None)
             if not call_rooms[r_key]:
                 del call_rooms[r_key]
 
-        # Notify remaining peers that this peer left
         if r_key in call_rooms:
             for conn in list(call_rooms[r_key].keys()):
                 try:
