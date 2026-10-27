@@ -30,7 +30,7 @@ CALL_HOST_ROLES = [
 
 class InitiateCallRequest(BaseModel):
     room_id: str
-    call_type: str = "video"
+    call_type: str = "video"  # "video" or "audio"
     target_user_id: Optional[uuid.UUID] = None
 
 
@@ -48,16 +48,20 @@ async def get_active_club_call(
     current_user: User = Depends(get_current_user),
 ):
     if not current_user.tenant_id:
-        return {"active": False, "room_id": None, "participant_count": 0}
+        return {"active": False, "room_id": None, "participant_count": 0, "call_type": "video"}
 
     room_id = f"club-meeting-{str(current_user.tenant_id).lower()}"
     participants = call_rooms.get(room_id, {})
     count = len(participants)
 
+    first_info = next(iter(participants.values()), {}) if participants else {}
+    call_type = first_info.get("call_type", "video")
+
     return {
         "active": count > 0,
         "room_id": room_id,
         "participant_count": count,
+        "call_type": call_type,
     }
 
 
@@ -100,7 +104,7 @@ async def initiate_call(
     }
 
     await manager.broadcast_to_tenant(tenant_id_str, payload)
-    return {"status": "ringing", "room_id": req.room_id}
+    return {"status": "ringing", "room_id": req.room_id, "call_type": req.call_type}
 
 
 @router.post("/decline")
@@ -128,7 +132,6 @@ async def end_call(
 ):
     r_key = str(req.room_id).lower()
 
-    # If Host explicitly ends the call, terminate connection for all active peers in room
     if r_key in call_rooms:
         for conn in list(call_rooms[r_key].keys()):
             try:
@@ -224,7 +227,7 @@ async def webrtc_signaling_endpoint(
             data = await websocket.receive_json()
             msg_type = data.get("type")
 
-            # Host explicit end meeting signal forwarded to all
+            # Host explicit end meeting signal
             if msg_type == "host-end-meeting" and is_host:
                 for conn in list(call_rooms[r_key].keys()):
                     try:
@@ -241,6 +244,7 @@ async def webrtc_signaling_endpoint(
                     )
                 break
 
+            # Host mute & kick controls
             if msg_type == "host-mute-peer" and is_host:
                 target_peer_id = data.get("target_peer_id")
                 for conn, info in list(call_rooms[r_key].items()):
@@ -262,6 +266,7 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
+            # Standard WebRTC & mute state relay
             for conn in list(call_rooms[r_key].keys()):
                 if conn != websocket:
                     try:
@@ -271,13 +276,11 @@ async def webrtc_signaling_endpoint(
     except (WebSocketDisconnect, Exception):
         pass
     finally:
-        # Check if the disconnecting peer was the host of a group meeting
         was_host_leaving = is_host and "club-meeting" in r_key
 
         if r_key in call_rooms:
             call_rooms[r_key].pop(websocket, None)
 
-            # If Host disconnected, terminate the entire room for remaining members
             if was_host_leaving and call_rooms[r_key]:
                 for conn in list(call_rooms[r_key].keys()):
                     try:
@@ -301,7 +304,6 @@ async def webrtc_signaling_endpoint(
             except Exception:
                 pass
 
-        # If ordinary member left, notify peers
         if r_key in call_rooms:
             for conn in list(call_rooms[r_key].keys()):
                 try:
