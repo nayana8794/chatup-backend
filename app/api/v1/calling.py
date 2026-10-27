@@ -203,7 +203,6 @@ async def webrtc_signaling_endpoint(
     meta = call_room_meta.get(r_key, {})
     room_call_type = meta.get("call_type", "video")
 
-    # Send room metadata immediately to newly connected peer
     try:
         await websocket.send_json({
             "type": "room-info",
@@ -247,6 +246,7 @@ async def webrtc_signaling_endpoint(
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type")
+            target_peer_id = data.get("target_peer_id")
 
             if msg_type == "host-end-meeting" and is_host:
                 for conn in list(call_rooms[r_key].keys()):
@@ -267,7 +267,6 @@ async def webrtc_signaling_endpoint(
                 break
 
             if msg_type == "host-mute-peer" and is_host:
-                target_peer_id = data.get("target_peer_id")
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
                         try:
@@ -277,7 +276,6 @@ async def webrtc_signaling_endpoint(
                 continue
 
             if msg_type == "host-kick-peer" and is_host:
-                target_peer_id = data.get("target_peer_id")
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
                         try:
@@ -287,12 +285,21 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            for conn in list(call_rooms[r_key].keys()):
-                if conn != websocket:
-                    try:
-                        await conn.send_json(data)
-                    except Exception:
-                        pass
+            # Targeted Peer Routing (Prevents offer/answer cross-talk and invalid state errors)
+            if target_peer_id:
+                for conn, info in list(call_rooms[r_key].items()):
+                    if info["user_id"].lower() == str(target_peer_id).lower():
+                        try:
+                            await conn.send_json(data)
+                        except Exception:
+                            pass
+            else:
+                for conn in list(call_rooms[r_key].keys()):
+                    if conn != websocket:
+                        try:
+                            await conn.send_json(data)
+                        except Exception:
+                            pass
     except (WebSocketDisconnect, Exception):
         pass
     finally:
