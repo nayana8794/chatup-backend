@@ -285,7 +285,7 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            # Targeted Peer Routing (Prevents offer/answer cross-talk and invalid state errors)
+            # Targeted Peer Routing
             if target_peer_id:
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"].lower() == str(target_peer_id).lower():
