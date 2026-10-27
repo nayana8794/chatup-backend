@@ -15,7 +15,10 @@ from app.models.user import User
 
 router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
 
+# Active rooms connection tracker
 call_rooms: Dict[str, Dict[WebSocket, dict]] = {}
+# Active rooms metadata tracker (stores call_type, host_id, etc.)
+call_room_meta: Dict[str, dict] = {}
 
 CALL_HOST_ROLES = [
     "SUPER_ADMIN",
@@ -54,8 +57,9 @@ async def get_active_club_call(
     participants = call_rooms.get(room_id, {})
     count = len(participants)
 
-    first_info = next(iter(participants.values()), {}) if participants else {}
-    call_type = first_info.get("call_type", "video")
+    # Reliable call_type lookup from room metadata
+    meta = call_room_meta.get(room_id, {})
+    call_type = meta.get("call_type", "video")
 
     return {
         "active": count > 0,
@@ -81,6 +85,14 @@ async def initiate_call(
         )
 
     tenant_id_str = str(current_user.tenant_id).lower()
+    r_key = str(req.room_id).lower()
+
+    # Save active call metadata including accurate call_type
+    call_room_meta[r_key] = {
+        "call_type": req.call_type,
+        "host_id": str(current_user.id),
+        "is_direct": bool(req.target_user_id),
+    }
 
     target_user_name = None
     if req.target_user_id:
@@ -131,6 +143,9 @@ async def end_call(
     current_user: User = Depends(get_current_user),
 ):
     r_key = str(req.room_id).lower()
+
+    if r_key in call_room_meta:
+        del call_room_meta[r_key]
 
     if r_key in call_rooms:
         for conn in list(call_rooms[r_key].keys()):
@@ -189,7 +204,6 @@ async def webrtc_signaling_endpoint(
 
     is_host = user_role in CALL_HOST_ROLES
 
-    # Send existing peers to newly joined participant
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
@@ -209,7 +223,6 @@ async def webrtc_signaling_endpoint(
         "is_host": is_host,
     }
 
-    # Notify existing peers that a new participant joined
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
@@ -227,7 +240,6 @@ async def webrtc_signaling_endpoint(
             data = await websocket.receive_json()
             msg_type = data.get("type")
 
-            # Host explicit end meeting signal
             if msg_type == "host-end-meeting" and is_host:
                 for conn in list(call_rooms[r_key].keys()):
                     try:
@@ -237,6 +249,8 @@ async def webrtc_signaling_endpoint(
                         })
                     except Exception:
                         pass
+                if r_key in call_room_meta:
+                    del call_room_meta[r_key]
                 if tenant_id_str:
                     await manager.broadcast_to_tenant(
                         tenant_id_str,
@@ -244,7 +258,6 @@ async def webrtc_signaling_endpoint(
                     )
                 break
 
-            # Host mute & kick controls
             if msg_type == "host-mute-peer" and is_host:
                 target_peer_id = data.get("target_peer_id")
                 for conn, info in list(call_rooms[r_key].items()):
@@ -266,7 +279,6 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            # Standard WebRTC & mute state relay
             for conn in list(call_rooms[r_key].keys()):
                 if conn != websocket:
                     try:
@@ -291,9 +303,13 @@ async def webrtc_signaling_endpoint(
                     except Exception:
                         pass
                 call_rooms[r_key].clear()
+                if r_key in call_room_meta:
+                    del call_room_meta[r_key]
 
             if not call_rooms[r_key]:
                 del call_rooms[r_key]
+                if r_key in call_room_meta:
+                    del call_room_meta[r_key]
 
         if was_host_leaving and tenant_id_str:
             try:
