@@ -15,9 +15,7 @@ from app.models.user import User
 
 router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
 
-# Active rooms connection tracker
 call_rooms: Dict[str, Dict[WebSocket, dict]] = {}
-# Active rooms metadata tracker (stores call_type, host_id, etc.)
 call_room_meta: Dict[str, dict] = {}
 
 CALL_HOST_ROLES = [
@@ -57,7 +55,6 @@ async def get_active_club_call(
     participants = call_rooms.get(room_id, {})
     count = len(participants)
 
-    # Reliable call_type lookup from room metadata
     meta = call_room_meta.get(room_id, {})
     call_type = meta.get("call_type", "video")
 
@@ -86,10 +83,10 @@ async def initiate_call(
 
     tenant_id_str = str(current_user.tenant_id).lower()
     r_key = str(req.room_id).lower()
+    clean_call_type = req.call_type.lower()
 
-    # Save active call metadata including accurate call_type
     call_room_meta[r_key] = {
-        "call_type": req.call_type,
+        "call_type": clean_call_type,
         "host_id": str(current_user.id),
         "is_direct": bool(req.target_user_id),
     }
@@ -109,14 +106,14 @@ async def initiate_call(
         "caller_id": str(current_user.id),
         "caller_name": current_user.full_name,
         "caller_role": current_user.role.value,
-        "call_type": req.call_type,
+        "call_type": clean_call_type,
         "is_direct": bool(req.target_user_id),
         "target_user_id": str(req.target_user_id) if req.target_user_id else None,
         "target_user_name": target_user_name,
     }
 
     await manager.broadcast_to_tenant(tenant_id_str, payload)
-    return {"status": "ringing", "room_id": req.room_id, "call_type": req.call_type}
+    return {"status": "ringing", "room_id": req.room_id, "call_type": clean_call_type}
 
 
 @router.post("/decline")
@@ -203,6 +200,17 @@ async def webrtc_signaling_endpoint(
         call_rooms[r_key] = {}
 
     is_host = user_role in CALL_HOST_ROLES
+    meta = call_room_meta.get(r_key, {})
+    room_call_type = meta.get("call_type", "video")
+
+    # Send room metadata immediately to newly connected peer
+    try:
+        await websocket.send_json({
+            "type": "room-info",
+            "call_type": room_call_type,
+        })
+    except Exception:
+        pass
 
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
