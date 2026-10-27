@@ -15,7 +15,6 @@ from app.models.user import User
 
 router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
 
-# WebRTC Room Connection Tracker: { room_id: {websocket: user_info} }
 call_rooms: Dict[str, Dict[WebSocket, dict]] = {}
 
 CALL_HOST_ROLES = [
@@ -128,7 +127,6 @@ async def end_call(
     current_user: User = Depends(get_current_user),
 ):
     if current_user.tenant_id:
-        # Only broadcast CALL_ENDED when explicitly ended by host or when no participants remain
         await manager.broadcast_to_tenant(
             str(current_user.tenant_id).lower(),
             {
