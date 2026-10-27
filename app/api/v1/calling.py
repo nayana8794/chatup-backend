@@ -73,7 +73,7 @@ async def initiate_call(
     if not req.target_user_id and current_user.role.value not in CALL_HOST_ROLES:
         raise HTTPException(
             status_code=403,
-            detail="Only President, Secretary, or Planner can initiate club conference meetings",
+            detail="Only President or Club Officers can initiate club conference meetings",
         )
 
     tenant_id_str = str(current_user.tenant_id).lower()
@@ -126,6 +126,21 @@ async def end_call(
     req: EndCallRequest,
     current_user: User = Depends(get_current_user),
 ):
+    r_key = str(req.room_id).lower()
+
+    # If Host explicitly ends the call, terminate connection for all active peers in room
+    if r_key in call_rooms:
+        for conn in list(call_rooms[r_key].keys()):
+            try:
+                await conn.send_json({
+                    "type": "meeting-ended-by-host",
+                    "message": "The meeting was ended by the President / Host.",
+                })
+            except Exception:
+                pass
+        call_rooms[r_key].clear()
+        del call_rooms[r_key]
+
     if current_user.tenant_id:
         await manager.broadcast_to_tenant(
             str(current_user.tenant_id).lower(),
@@ -161,6 +176,7 @@ async def webrtc_signaling_endpoint(
             return
         user_name = user.full_name
         user_role = user.role.value
+        tenant_id_str = str(user.tenant_id).lower() if user.tenant_id else None
 
     await websocket.accept()
 
@@ -168,6 +184,9 @@ async def webrtc_signaling_endpoint(
     if r_key not in call_rooms:
         call_rooms[r_key] = {}
 
+    is_host = user_role in CALL_HOST_ROLES
+
+    # Send existing peers to newly joined participant
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
@@ -184,8 +203,10 @@ async def webrtc_signaling_endpoint(
         "user_id": str(user_id),
         "user_name": user_name,
         "user_role": user_role,
+        "is_host": is_host,
     }
 
+    # Notify existing peers that a new participant joined
     for conn, info in list(call_rooms[r_key].items()):
         if conn != websocket:
             try:
@@ -203,7 +224,24 @@ async def webrtc_signaling_endpoint(
             data = await websocket.receive_json()
             msg_type = data.get("type")
 
-            if msg_type == "host-mute-peer":
+            # Host explicit end meeting signal forwarded to all
+            if msg_type == "host-end-meeting" and is_host:
+                for conn in list(call_rooms[r_key].keys()):
+                    try:
+                        await conn.send_json({
+                            "type": "meeting-ended-by-host",
+                            "message": "The meeting was ended by the President / Host.",
+                        })
+                    except Exception:
+                        pass
+                if tenant_id_str:
+                    await manager.broadcast_to_tenant(
+                        tenant_id_str,
+                        {"type": "CALL_ENDED", "room_id": room_id, "ended_by_id": str(user_id)},
+                    )
+                break
+
+            if msg_type == "host-mute-peer" and is_host:
                 target_peer_id = data.get("target_peer_id")
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
@@ -213,7 +251,7 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            if msg_type == "host-kick-peer":
+            if msg_type == "host-kick-peer" and is_host:
                 target_peer_id = data.get("target_peer_id")
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
@@ -233,11 +271,37 @@ async def webrtc_signaling_endpoint(
     except (WebSocketDisconnect, Exception):
         pass
     finally:
+        # Check if the disconnecting peer was the host of a group meeting
+        was_host_leaving = is_host and "club-meeting" in r_key
+
         if r_key in call_rooms:
             call_rooms[r_key].pop(websocket, None)
+
+            # If Host disconnected, terminate the entire room for remaining members
+            if was_host_leaving and call_rooms[r_key]:
+                for conn in list(call_rooms[r_key].keys()):
+                    try:
+                        await conn.send_json({
+                            "type": "meeting-ended-by-host",
+                            "message": "The President has left. The meeting has ended.",
+                        })
+                    except Exception:
+                        pass
+                call_rooms[r_key].clear()
+
             if not call_rooms[r_key]:
                 del call_rooms[r_key]
 
+        if was_host_leaving and tenant_id_str:
+            try:
+                await manager.broadcast_to_tenant(
+                    tenant_id_str,
+                    {"type": "CALL_ENDED", "room_id": room_id, "ended_by_id": str(user_id)},
+                )
+            except Exception:
+                pass
+
+        # If ordinary member left, notify peers
         if r_key in call_rooms:
             for conn in list(call_rooms[r_key].keys()):
                 try:
