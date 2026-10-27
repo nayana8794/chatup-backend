@@ -1,11 +1,13 @@
 # chatup/backend/app/api/v1/social.py
 import os
 import uuid
-import shutil
+import logging
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, or_
+import cloudinary
+import cloudinary.uploader
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.ws_manager import manager
@@ -20,13 +22,26 @@ from app.schemas.social import (
     CommentResponse,
 )
 
+logger = logging.getLogger("uvicorn.error")
+
 router = APIRouter(prefix="/social", tags=["Club Social Wall"])
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Configure Cloudinary credentials from Environment Variables
+cloudinary_cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+cloudinary_api_key = os.getenv("CLOUDINARY_API_KEY")
+cloudinary_api_secret = os.getenv("CLOUDINARY_API_SECRET")
 
-# Safe multi-image upload handling both files array and single file
+if cloudinary_cloud_name and cloudinary_api_key and cloudinary_api_secret:
+    cloudinary.config(
+        cloud_name=cloudinary_cloud_name.strip(),
+        api_key=cloudinary_api_key.strip(),
+        api_secret=cloudinary_api_secret.strip(),
+        secure=True,
+    )
+elif os.getenv("CLOUDINARY_URL"):
+    cloudinary.config(secure=True)
+
+
 @router.post("/upload-images")
 async def upload_multiple_images(
     files: List[UploadFile] = File(default=[]),
@@ -41,26 +56,40 @@ async def upload_multiple_images(
         raise HTTPException(status_code=400, detail="No image files provided")
 
     saved_urls = []
+
     for f in upload_list:
         try:
-            filename = f.filename or "photo.jpg"
-            file_ext = filename.split(".")[-1].lower() if "." in filename else "jpg"
-            unique_filename = f"{uuid.uuid4()}.{file_ext}"
-            file_path = os.path.join(UPLOAD_DIR, unique_filename)
+            # Rewind file stream to beginning to avoid empty payload
+            f.file.seek(0)
 
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(f.file, buffer)
+            # Upload directly and permanently to Cloudinary Cloud CDN
+            upload_result = cloudinary.uploader.upload(
+                f.file,
+                folder="chatup_social",
+                resource_type="image",
+                use_filename=False,
+                unique_filename=True,
+            )
 
-            saved_urls.append(f"/static/uploads/{unique_filename}")
-        except Exception:
+            secure_url = upload_result.get("secure_url")
+            if secure_url:
+                saved_urls.append(secure_url)
+            else:
+                logger.error("Cloudinary failed to return a secure URL for file: %s", f.filename)
+
+        except Exception as e:
+            logger.error("Cloudinary upload exception for %s: %s", f.filename, str(e))
             continue
 
     if not saved_urls:
-        raise HTTPException(status_code=500, detail="Failed to save uploaded photos")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to upload photos to cloud storage. Please check Cloudinary configuration.",
+        )
 
     return {"status": "success", "image_urls": saved_urls}
 
-# Point 1 Fix: Ensure all club members can see posts created in the club workspace
+
 @router.get("/posts", response_model=List[PostResponse])
 async def list_social_posts(
     current_user: User = Depends(get_current_user),
@@ -134,6 +163,7 @@ async def list_social_posts(
 
     return response_list
 
+
 @router.post("/posts", response_model=PostResponse)
 async def create_social_post(
     req: PostCreateRequest,
@@ -162,7 +192,6 @@ async def create_social_post(
     await db.commit()
     await db.refresh(post)
 
-    # Real-time WebSocket broadcast to all members
     first_tenant_id = (await db.execute(select(Tenant.id).limit(1))).scalar_one_or_none()
     broadcast_tenants = {str(t).lower() for t in [tenant_id, first_tenant_id, current_user.tenant_id] if t}
     for t_id in broadcast_tenants:
@@ -185,6 +214,7 @@ async def create_social_post(
         is_liked_by_me=False,
         comments=[],
     )
+
 
 @router.put("/posts/{post_id}", response_model=PostResponse)
 async def update_social_post(
@@ -229,6 +259,7 @@ async def update_social_post(
         comments=[],
     )
 
+
 @router.delete("/posts/{post_id}")
 async def delete_social_post(
     post_id: uuid.UUID,
@@ -253,6 +284,7 @@ async def delete_social_post(
         )
 
     return {"status": "success", "message": "Post deleted successfully"}
+
 
 @router.post("/posts/{post_id}/like")
 async def toggle_post_like(
@@ -286,6 +318,7 @@ async def toggle_post_like(
         )
 
     return {"status": "success", "liked": liked}
+
 
 @router.post("/posts/{post_id}/comments", response_model=CommentResponse)
 async def add_post_comment(
