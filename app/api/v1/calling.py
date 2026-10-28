@@ -1,6 +1,7 @@
 # chatup/backend/app/api/v1/calling.py
 import uuid
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
+from datetime import datetime
 from pydantic import BaseModel
 from fastapi import (
     APIRouter,
@@ -26,6 +27,9 @@ router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
 
 call_rooms: Dict[str, Dict[WebSocket, dict]] = {}
 call_room_meta: Dict[str, dict] = {}
+
+# Active call session tracking to accurately detect and dispatch Missed Calls
+active_call_sessions: Dict[str, dict] = {}
 
 CALL_HOST_ROLES = [
     "SUPER_ADMIN",
@@ -95,7 +99,6 @@ async def initiate_call(
     r_key = str(req.room_id).lower()
     clean_call_type = req.call_type.lower()
 
-    # If meeting already active, retain room metadata and call_type
     if r_key not in call_room_meta:
         call_room_meta[r_key] = {
             "call_type": clean_call_type,
@@ -114,6 +117,16 @@ async def initiate_call(
             raise HTTPException(status_code=404, detail="Target user not found")
         target_user_name = target_user.full_name
 
+    # Track session for missed call detection
+    active_call_sessions[r_key] = {
+        "caller_id": current_user.id,
+        "caller_name": current_user.full_name,
+        "call_type": clean_call_type,
+        "target_user_id": req.target_user_id,
+        "answered_user_ids": set(),
+        "created_at": datetime.utcnow().replace(tzinfo=None),
+    }
+
     payload = {
         "type": "INCOMING_CALL",
         "room_id": req.room_id,
@@ -126,22 +139,29 @@ async def initiate_call(
         "target_user_name": target_user_name,
     }
 
-    # 1. Live WebSocket Broadcast
+    # 1. Real-time WebSocket Broadcast
     await manager.broadcast_to_tenant(tenant_id_str, payload)
 
-    # 2. Web Push Notification to Locked Phones
+    # 2. High-Urgency Lock-Screen Web Push with Call Action Buttons
+    call_url = f"/calling?room={req.room_id}&type={clean_call_type}&autoJoin=true"
+
     if req.target_user_id:
-        # Direct 1-on-1 Call
         background_tasks.add_task(
             dispatch_push_to_users,
             user_ids=[req.target_user_id],
-            title="📞 Incoming Club Call",
-            body=f"{current_user.full_name} is calling you ({clean_call_type} meeting)...",
-            url=f"/calling?room={req.room_id}&type={clean_call_type}",
-            tag="incoming-call",
+            title=f"📞 Incoming {clean_call_type.capitalize()} Call",
+            body=f"{current_user.full_name} is calling you...",
+            url=call_url,
+            tag=f"call-{r_key}",
+            badge_count=1,
+            data={
+                "type": "INCOMING_CALL",
+                "room_id": req.room_id,
+                "call_type": clean_call_type,
+                "caller_name": current_user.full_name,
+            },
         )
     else:
-        # Club Group Meeting
         club_members = (
             await db.execute(
                 select(User.id).where(
@@ -155,10 +175,17 @@ async def initiate_call(
             background_tasks.add_task(
                 dispatch_push_to_users,
                 user_ids=list(club_members),
-                title="🦁 Club Meeting Started",
-                body=f"{current_user.full_name} started a live {clean_call_type} meeting. Tap to join.",
-                url=f"/calling?room={req.room_id}&type={clean_call_type}",
-                tag="incoming-call",
+                title="🦁 Live Club Meeting Started",
+                body=f"{current_user.full_name} started a {clean_call_type} meeting. Tap to join.",
+                url=call_url,
+                tag=f"call-{r_key}",
+                badge_count=1,
+                data={
+                    "type": "INCOMING_CALL",
+                    "room_id": req.room_id,
+                    "call_type": clean_call_type,
+                    "caller_name": current_user.full_name,
+                },
             )
 
     return {"status": "ringing", "room_id": req.room_id, "call_type": clean_call_type}
@@ -167,8 +194,11 @@ async def initiate_call(
 @router.post("/decline")
 async def decline_call(
     req: DeclineCallRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
 ):
+    r_key = str(req.room_id).lower()
+
     if current_user.tenant_id:
         await manager.broadcast_to_tenant(
             str(current_user.tenant_id).lower(),
@@ -179,13 +209,28 @@ async def decline_call(
                 "declined_by_name": current_user.full_name,
             },
         )
+
+    # Dismiss ringing lock screen notification on caller's and target's devices
+    if current_user.tenant_id:
+        background_tasks.add_task(
+            dispatch_push_to_users,
+            user_ids=[current_user.id],
+            title="",
+            body="",
+            url="/",
+            tag=f"call-{r_key}",
+            data={"type": "CALL_DISMISSED", "room_id": req.room_id},
+        )
+
     return {"status": "declined"}
 
 
 @router.post("/end")
 async def end_call(
     req: EndCallRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     r_key = str(req.room_id).lower()
 
@@ -204,6 +249,31 @@ async def end_call(
         call_rooms[r_key].clear()
         del call_rooms[r_key]
 
+    # Check for Missed Call in direct calls
+    session = active_call_sessions.pop(r_key, None)
+    if session and session.get("target_user_id"):
+        target_uid = session["target_user_id"]
+        answered_set = session.get("answered_user_ids", set())
+
+        # If recipient never joined the call before caller ended it -> MISSED CALL!
+        if str(target_uid).lower() not in answered_set:
+            background_tasks.add_task(
+                dispatch_push_to_users,
+                user_ids=[target_uid],
+                title="❌ Missed Call",
+                body=f"You missed a {session['call_type']} call from {session['caller_name']}.",
+                url="/calling",
+                tag=f"missed-call-{r_key}",
+                badge_count=1,
+                data={
+                    "type": "MISSED_CALL",
+                    "room_id": req.room_id,
+                    "caller_id": str(session["caller_id"]),
+                    "caller_name": session["caller_name"],
+                },
+            )
+
+    # Dismiss any active ringing notification from all members' lock screens
     if current_user.tenant_id:
         await manager.broadcast_to_tenant(
             str(current_user.tenant_id).lower(),
@@ -214,6 +284,7 @@ async def end_call(
                 "ended_by_name": current_user.full_name,
             },
         )
+
     return {"status": "ended"}
 
 
@@ -246,6 +317,10 @@ async def webrtc_signaling_endpoint(
     r_key = str(room_id).lower()
     if r_key not in call_rooms:
         call_rooms[r_key] = {}
+
+    # Mark user as having answered the call
+    if r_key in active_call_sessions:
+        active_call_sessions[r_key]["answered_user_ids"].add(str(user_id).lower())
 
     is_host = user_role in CALL_HOST_ROLES
     meta = call_room_meta.get(r_key, {})
@@ -342,7 +417,6 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            # Targeted Peer Routing
             if target_peer_id:
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"].lower() == str(target_peer_id).lower():
