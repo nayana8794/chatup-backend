@@ -36,3 +36,4 @@ uvloop==0.23.0
 watchfiles==1.1.1
 websockets==15.0.1
 cloudinary>=1.41.0
+pywebpush>=2.0.0

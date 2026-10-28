@@ -2,7 +2,15 @@
 import uuid
 from typing import Dict, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+    Query,
+    BackgroundTasks,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import jwt
@@ -11,6 +19,7 @@ from app.core.database import get_db, AsyncSessionLocal
 from app.core.deps import get_current_user
 from app.core.security import SECRET_KEY, ALGORITHM
 from app.core.ws_manager import manager
+from app.core.push_service import dispatch_push_to_users
 from app.models.user import User
 
 router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
@@ -69,6 +78,7 @@ async def get_active_club_call(
 @router.post("/initiate")
 async def initiate_call(
     req: InitiateCallRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -116,7 +126,41 @@ async def initiate_call(
         "target_user_name": target_user_name,
     }
 
+    # 1. Live WebSocket Broadcast
     await manager.broadcast_to_tenant(tenant_id_str, payload)
+
+    # 2. Web Push Notification to Locked Phones
+    if req.target_user_id:
+        # Direct 1-on-1 Call
+        background_tasks.add_task(
+            dispatch_push_to_users,
+            user_ids=[req.target_user_id],
+            title="📞 Incoming Club Call",
+            body=f"{current_user.full_name} is calling you ({clean_call_type} meeting)...",
+            url=f"/calling?room={req.room_id}&type={clean_call_type}",
+            tag="incoming-call",
+        )
+    else:
+        # Club Group Meeting
+        club_members = (
+            await db.execute(
+                select(User.id).where(
+                    User.tenant_id == current_user.tenant_id,
+                    User.id != current_user.id,
+                    User.is_active == True,
+                )
+            )
+        ).scalars().all()
+        if club_members:
+            background_tasks.add_task(
+                dispatch_push_to_users,
+                user_ids=list(club_members),
+                title="🦁 Club Meeting Started",
+                body=f"{current_user.full_name} started a live {clean_call_type} meeting. Tap to join.",
+                url=f"/calling?room={req.room_id}&type={clean_call_type}",
+                tag="incoming-call",
+            )
+
     return {"status": "ringing", "room_id": req.room_id, "call_type": clean_call_type}
 
 

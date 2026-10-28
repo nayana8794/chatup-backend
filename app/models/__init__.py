@@ -6,6 +6,7 @@ from app.models.chat import ChatRoom, ChatParticipant, ChatMessage, RoomType, Ch
 from app.models.event import Event, EventRSVP, EventType, RSVPStatus
 from app.models.financial import DuesInvoice, ClubTransaction, DuesStatus, TransactionType
 from app.models.social import SocialPost, PostLike, PostComment
+from app.models.push_subscription import PushSubscription
 
 __all__ = [
     "Tenant",
@@ -30,4 +31,5 @@ __all__ = [
     "SocialPost",
     "PostLike",
     "PostComment",
+    "PushSubscription",
 ]

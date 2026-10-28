@@ -5,7 +5,13 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     DATABASE_URL: str
 
+    # Web Push Notification Settings (VAPID)
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_CLAIM_EMAIL: str = "mailto:admin@chatup.com"
+
     class Config:
         env_file = ".env"
+        extra = "allow"
 
 settings = Settings()

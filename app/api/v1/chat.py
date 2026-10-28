@@ -1,20 +1,40 @@
 # chatup/backend/app/api/v1/chat.py
 import uuid
+import asyncio
 from datetime import datetime
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+    Query,
+    BackgroundTasks,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, desc, func
 import jwt
+from pydantic import BaseModel
 
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.deps import get_current_user
 from app.core.security import SECRET_KEY, ALGORITHM
 from app.core.ws_manager import manager
-from app.models.chat import ChatRoom, ChatParticipant, ChatMessage, RoomType, ChatReadReceipt
+from app.core.push_service import dispatch_push_to_users
+from app.models.chat import (
+    ChatRoom,
+    ChatParticipant,
+    ChatMessage,
+    RoomType,
+    ChatReadReceipt,
+)
 from app.models.user import User, UserRole
-from app.schemas.chat import ChatRoomResponse, MessageResponse, CreateDirectChatRequest
-from pydantic import BaseModel
+from app.schemas.chat import (
+    ChatRoomResponse,
+    MessageResponse,
+    CreateDirectChatRequest,
+)
 
 router = APIRouter(prefix="/chat", tags=["Real-time Chat"])
 
@@ -30,27 +50,46 @@ BOARD_ROLES = [
     UserRole.VICE_TREASURER,
 ]
 
-# Helper to automatically ensure General and Board rooms exist for a club
+
 async def ensure_club_default_rooms(tenant_id: uuid.UUID, db: AsyncSession):
     general_room = (
         await db.execute(
-            select(ChatRoom).where(ChatRoom.tenant_id == tenant_id, ChatRoom.room_type == RoomType.GENERAL)
+            select(ChatRoom).where(
+                ChatRoom.tenant_id == tenant_id,
+                ChatRoom.room_type == RoomType.GENERAL,
+            )
         )
     ).scalar_one_or_none()
 
     if not general_room:
-        db.add(ChatRoom(tenant_id=tenant_id, name="General Club Chat", room_type=RoomType.GENERAL))
+        db.add(
+            ChatRoom(
+                tenant_id=tenant_id,
+                name="General Club Chat",
+                room_type=RoomType.GENERAL,
+            )
+        )
 
     board_room = (
         await db.execute(
-            select(ChatRoom).where(ChatRoom.tenant_id == tenant_id, ChatRoom.room_type == RoomType.BOARD)
+            select(ChatRoom).where(
+                ChatRoom.tenant_id == tenant_id,
+                ChatRoom.room_type == RoomType.BOARD,
+            )
         )
     ).scalar_one_or_none()
 
     if not board_room:
-        db.add(ChatRoom(tenant_id=tenant_id, name="Board Members Only", room_type=RoomType.BOARD))
+        db.add(
+            ChatRoom(
+                tenant_id=tenant_id,
+                name="Board Members Only",
+                room_type=RoomType.BOARD,
+            )
+        )
 
     await db.commit()
+
 
 @router.get("/rooms", response_model=List[ChatRoomResponse])
 async def get_user_chat_rooms(
@@ -107,7 +146,6 @@ async def get_user_chat_rooms(
             )
         ).scalar_one_or_none()
 
-        # Unread messages ගණනය කිරීම (scalars().first() භාවිතා කර MultipleResultsFound වැළැක්වීම)
         read_receipt = (
             await db.execute(
                 select(ChatReadReceipt)
@@ -140,14 +178,14 @@ async def get_user_chat_rooms(
 
     return response_list
 
+
 @router.post("/rooms/{room_id}/read")
 async def mark_room_as_read(
     room_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    now = datetime.utcnow()
-    # පවතින සියලු receipts සොයා බැලීම
+    now = datetime.utcnow().replace(tzinfo=None)
     receipts = (
         await db.execute(
             select(ChatReadReceipt)
@@ -160,9 +198,7 @@ async def mark_room_as_read(
     ).scalars().all()
 
     if receipts:
-        # නවතම receipt එක update කිරීම
         receipts[0].last_read_at = now
-        # අතිරික්ත duplicate receipts තිබේ නම් database එකෙන් මකාදැමීම
         for duplicate in receipts[1:]:
             await db.delete(duplicate)
     else:
@@ -170,6 +206,7 @@ async def mark_room_as_read(
 
     await db.commit()
     return {"status": "success", "room_id": str(room_id)}
+
 
 @router.get("/rooms/{room_id}/messages", response_model=List[MessageResponse])
 async def get_room_messages(
@@ -201,13 +238,16 @@ async def get_room_messages(
         for msg, name, role in messages
     ]
 
+
 class SendMessageRequest(BaseModel):
     content: str
+
 
 @router.post("/rooms/{room_id}/messages", response_model=MessageResponse)
 async def send_room_message(
     room_id: uuid.UUID,
     req: SendMessageRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -215,7 +255,7 @@ async def send_room_message(
     if not content:
         raise HTTPException(status_code=400, detail="Message content cannot be empty")
 
-    now = datetime.utcnow()
+    now = datetime.utcnow().replace(tzinfo=None)
     msg = ChatMessage(
         room_id=room_id,
         sender_id=current_user.id,
@@ -237,10 +277,53 @@ async def send_room_message(
         "created_at": msg.created_at.isoformat(),
     }
 
-    # Broadcast to room members & tenant
+    # Broadcast via WebSockets
     await manager.broadcast_to_room(str(room_id), payload)
     if current_user.tenant_id:
         await manager.broadcast_to_tenant(str(current_user.tenant_id), payload)
+
+    # Determine Web Push notification recipients
+    target_ids: List[uuid.UUID] = []
+    participant_ids = (
+        await db.execute(
+            select(ChatParticipant.user_id).where(
+                ChatParticipant.room_id == room_id,
+                ChatParticipant.user_id != current_user.id,
+            )
+        )
+    ).scalars().all()
+
+    if participant_ids:
+        target_ids = list(participant_ids)
+    else:
+        room_obj = (
+            await db.execute(select(ChatRoom).where(ChatRoom.id == room_id))
+        ).scalar_one_or_none()
+        if room_obj and room_obj.tenant_id:
+            if room_obj.room_type == RoomType.BOARD:
+                members_query = select(User.id).where(
+                    User.tenant_id == room_obj.tenant_id,
+                    User.id != current_user.id,
+                    User.role.in_(BOARD_ROLES),
+                    User.is_active == True,
+                )
+            else:
+                members_query = select(User.id).where(
+                    User.tenant_id == room_obj.tenant_id,
+                    User.id != current_user.id,
+                    User.is_active == True,
+                )
+            target_ids = list((await db.execute(members_query)).scalars().all())
+
+    if target_ids:
+        background_tasks.add_task(
+            dispatch_push_to_users,
+            user_ids=target_ids,
+            title=f"💬 {current_user.full_name}",
+            body=content[:100],
+            url="/chat",
+            tag=f"chat-{str(room_id)}",
+        )
 
     return MessageResponse(
         id=msg.id,
@@ -252,6 +335,7 @@ async def send_room_message(
         created_at=msg.created_at,
     )
 
+
 @router.post("/direct", response_model=ChatRoomResponse)
 async def get_or_create_direct_chat(
     req: CreateDirectChatRequest,
@@ -261,7 +345,9 @@ async def get_or_create_direct_chat(
     if req.target_user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot chat with yourself")
 
-    target_user = (await db.execute(select(User).where(User.id == req.target_user_id))).scalar_one_or_none()
+    target_user = (
+        await db.execute(select(User).where(User.id == req.target_user_id))
+    ).scalar_one_or_none()
     if not target_user:
         raise HTTPException(status_code=404, detail="Target user not found")
 
@@ -269,7 +355,10 @@ async def get_or_create_direct_chat(
         await db.execute(
             select(ChatParticipant.room_id)
             .join(ChatRoom, ChatParticipant.room_id == ChatRoom.id)
-            .where(ChatParticipant.user_id == current_user.id, ChatRoom.room_type == RoomType.DIRECT)
+            .where(
+                ChatParticipant.user_id == current_user.id,
+                ChatRoom.room_type == RoomType.DIRECT,
+            )
         )
     ).scalars().all()
 
@@ -277,7 +366,10 @@ async def get_or_create_direct_chat(
         await db.execute(
             select(ChatParticipant.room_id)
             .join(ChatRoom, ChatParticipant.room_id == ChatRoom.id)
-            .where(ChatParticipant.user_id == target_user.id, ChatRoom.room_type == RoomType.DIRECT)
+            .where(
+                ChatParticipant.user_id == target_user.id,
+                ChatRoom.room_type == RoomType.DIRECT,
+            )
         )
     ).scalars().all()
 
@@ -285,7 +377,12 @@ async def get_or_create_direct_chat(
 
     if common_rooms:
         room_id = list(common_rooms)[0]
-        return ChatRoomResponse(id=room_id, name=target_user.full_name, room_type=RoomType.DIRECT, unread_count=0)
+        return ChatRoomResponse(
+            id=room_id,
+            name=target_user.full_name,
+            room_type=RoomType.DIRECT,
+            unread_count=0,
+        )
 
     new_room = ChatRoom(tenant_id=current_user.tenant_id, room_type=RoomType.DIRECT)
     db.add(new_room)
@@ -295,7 +392,13 @@ async def get_or_create_direct_chat(
     db.add(ChatParticipant(room_id=new_room.id, user_id=target_user.id))
     await db.commit()
 
-    return ChatRoomResponse(id=new_room.id, name=target_user.full_name, room_type=RoomType.DIRECT, unread_count=0)
+    return ChatRoomResponse(
+        id=new_room.id,
+        name=target_user.full_name,
+        room_type=RoomType.DIRECT,
+        unread_count=0,
+    )
+
 
 # ================= LIVE ROOM WEBSOCKET ENDPOINT =================
 @router.websocket("/ws/{room_id}")
@@ -326,7 +429,7 @@ async def chat_websocket_endpoint(
 
             if content:
                 async with AsyncSessionLocal() as db:
-                    now = datetime.utcnow()
+                    now = datetime.utcnow().replace(tzinfo=None)
                     msg = ChatMessage(
                         room_id=uuid.UUID(room_id),
                         sender_id=user.id,
@@ -348,14 +451,53 @@ async def chat_websocket_endpoint(
                         "created_at": msg.created_at.isoformat(),
                     }
 
-                # 1. කාමරයේ සිටින අයට පණිවිඩය සෘජුවම යැවීම
+                    # Query participants for Web Push notification
+                    p_query = select(ChatParticipant.user_id).where(
+                        ChatParticipant.room_id == uuid.UUID(room_id),
+                        ChatParticipant.user_id != user.id,
+                    )
+                    sub_users = list((await db.execute(p_query)).scalars().all())
+
+                    if not sub_users:
+                        room_obj = (
+                            await db.execute(select(ChatRoom).where(ChatRoom.id == uuid.UUID(room_id)))
+                        ).scalar_one_or_none()
+                        if room_obj and room_obj.tenant_id:
+                            if room_obj.room_type == RoomType.BOARD:
+                                m_query = select(User.id).where(
+                                    User.tenant_id == room_obj.tenant_id,
+                                    User.id != user.id,
+                                    User.role.in_(BOARD_ROLES),
+                                    User.is_active == True,
+                                )
+                            else:
+                                m_query = select(User.id).where(
+                                    User.tenant_id == room_obj.tenant_id,
+                                    User.id != user.id,
+                                    User.is_active == True,
+                                )
+                            sub_users = list((await db.execute(m_query)).scalars().all())
+
+                # 1. Live WebSocket broadcast
                 await manager.broadcast_to_room(room_id, payload)
-                # 2. Club එකේ සියලු දෙනාට Notification එක, Sound Chime එක සහ Unread Badges යැවීම
                 if user.tenant_id:
                     await manager.broadcast_to_tenant(str(user.tenant_id), payload)
 
+                # 2. Async Web Push notification for locked/backgrounded devices
+                if sub_users:
+                    asyncio.create_task(
+                        dispatch_push_to_users(
+                            user_ids=sub_users,
+                            title=f"💬 {user.full_name}",
+                            body=content[:100],
+                            url="/chat",
+                            tag=f"chat-{room_id}",
+                        )
+                    )
+
     except WebSocketDisconnect:
         manager.disconnect_room(room_id, websocket)
+
 
 # ================= GLOBAL REAL-TIME SYNC WEBSOCKET =================
 @router.websocket("/ws/global/sync")
