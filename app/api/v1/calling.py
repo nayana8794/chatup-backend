@@ -31,7 +31,7 @@ CALL_HOST_ROLES = [
 
 class InitiateCallRequest(BaseModel):
     room_id: str
-    call_type: str = "video"  # "video" or "audio"
+    call_type: str = "video"
     target_user_id: Optional[uuid.UUID] = None
 
 
@@ -266,6 +266,7 @@ async def webrtc_signaling_endpoint(
                     )
                 break
 
+            # Host Control: Force Mute Peer Mic
             if msg_type == "host-mute-peer" and is_host:
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
@@ -275,6 +276,17 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
+            # Host Control: Force Turn Off Peer Camera
+            if msg_type == "host-stop-video-peer" and is_host:
+                for conn, info in list(call_rooms[r_key].items()):
+                    if info["user_id"] == target_peer_id:
+                        try:
+                            await conn.send_json({"type": "force-stop-video"})
+                        except Exception:
+                            pass
+                continue
+
+            # Host Control: Force Kick Peer from Meeting
             if msg_type == "host-kick-peer" and is_host:
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
