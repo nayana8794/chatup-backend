@@ -24,16 +24,11 @@ logger = logging.getLogger("uvicorn.error")
 
 
 def _get_formatted_private_key(raw_key: str) -> str:
-    """
-    Ensures the VAPID private key is in standard PEM format
-    so pywebpush / py_vapid can parse it without failing.
-    """
     clean_key = raw_key.strip().replace("\\n", "\n")
     if "BEGIN EC PRIVATE KEY" in clean_key or "BEGIN PRIVATE KEY" in clean_key:
         return clean_key
 
     try:
-        # If it is a raw 32-byte integer / base64 string, reconstruct standard PEM
         padding = "=" * ((4 - len(clean_key) % 4) % 4)
         b64 = clean_key + padding
         key_bytes = base64.urlsafe_b64decode(b64)
@@ -47,22 +42,24 @@ def _get_formatted_private_key(raw_key: str) -> str:
             )
             return pem.decode("utf-8")
     except Exception as e:
-        logger.debug("Key conversion fallback to original: %s", str(e))
+        logger.debug("Key conversion fallback: %s", str(e))
 
     return clean_key
 
 
 def _send_single_notification(subscription_info: dict, payload_data: str) -> Optional[str]:
-    """Synchronous pywebpush sender run in a thread with system sound alert and high urgency."""
     if not webpush:
-        logger.warning("pywebpush library is not installed in the environment.")
+        logger.warning("pywebpush library is not installed.")
         return None
 
     if not settings.VAPID_PRIVATE_KEY or not settings.VAPID_PUBLIC_KEY:
-        logger.warning("VAPID keys are missing in backend settings.")
+        logger.warning("VAPID keys are missing in backend configuration.")
         return None
 
     pem_private_key = _get_formatted_private_key(settings.VAPID_PRIVATE_KEY)
+
+    # Note: Only 'Urgency' in headers, NO duplicate 'TTL' in headers because pywebpush has ttl parameter
+    push_headers = {"Urgency": "high"}
 
     try:
         webpush(
@@ -70,10 +67,7 @@ def _send_single_notification(subscription_info: dict, payload_data: str) -> Opt
             data=payload_data,
             vapid_private_key=pem_private_key,
             vapid_claims={"sub": settings.VAPID_CLAIM_EMAIL},
-            headers={
-                "Urgency": "high",
-                "TTL": "86400",
-            },
+            headers=push_headers,
             ttl=86400,
         )
         return None
@@ -82,9 +76,21 @@ def _send_single_notification(subscription_info: dict, payload_data: str) -> Opt
             return subscription_info.get("endpoint")
         logger.error("WebPush delivery failure: %s", repr(ex))
         return None
-    except Exception as e:
-        logger.error("Unexpected error during webpush dispatch: %s", str(e))
-        return None
+    except Exception as e1:
+        # Fallback using raw private key string directly
+        try:
+            webpush(
+                subscription_info=subscription_info,
+                data=payload_data,
+                vapid_private_key=settings.VAPID_PRIVATE_KEY.strip(),
+                vapid_claims={"sub": settings.VAPID_CLAIM_EMAIL},
+                headers=push_headers,
+                ttl=86400,
+            )
+            return None
+        except Exception as e2:
+            logger.error("WebPush dispatch exception: %s (fallback failed: %s)", str(e1), str(e2))
+            return None
 
 
 async def dispatch_push_to_users(
@@ -96,10 +102,6 @@ async def dispatch_push_to_users(
     badge_count: int = 1,
     data: Optional[dict] = None,
 ):
-    """
-    Asynchronously queries all device subscriptions for the given users
-    and dispatches Web Push notifications with High Urgency, System Sound, and Icon Badges.
-    """
     if not user_ids or not settings.VAPID_PRIVATE_KEY or not settings.VAPID_PUBLIC_KEY:
         return
 
@@ -137,7 +139,6 @@ async def dispatch_push_to_users(
             if dead_ep:
                 dead_endpoints.append(dead_ep)
 
-        # Clean up stale / expired subscriptions
         if dead_endpoints:
             await db.execute(
                 delete(PushSubscription).where(PushSubscription.endpoint.in_(dead_endpoints))

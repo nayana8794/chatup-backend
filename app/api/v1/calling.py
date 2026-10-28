@@ -27,8 +27,6 @@ router = APIRouter(prefix="/calling", tags=["Audio & Video Calling"])
 
 call_rooms: Dict[str, Dict[WebSocket, dict]] = {}
 call_room_meta: Dict[str, dict] = {}
-
-# Active call session tracking to accurately detect and dispatch Missed Calls
 active_call_sessions: Dict[str, dict] = {}
 
 CALL_HOST_ROLES = [
@@ -44,7 +42,7 @@ CALL_HOST_ROLES = [
 
 class InitiateCallRequest(BaseModel):
     room_id: str
-    call_type: str = "video"  # "video" or "audio"
+    call_type: str = "video"
     target_user_id: Optional[uuid.UUID] = None
 
 
@@ -117,7 +115,6 @@ async def initiate_call(
             raise HTTPException(status_code=404, detail="Target user not found")
         target_user_name = target_user.full_name
 
-    # Track session for missed call detection
     active_call_sessions[r_key] = {
         "caller_id": current_user.id,
         "caller_name": current_user.full_name,
@@ -139,10 +136,10 @@ async def initiate_call(
         "target_user_name": target_user_name,
     }
 
-    # 1. Real-time WebSocket Broadcast
+    # 1. Live WebSocket broadcast
     await manager.broadcast_to_tenant(tenant_id_str, payload)
 
-    # 2. High-Urgency Lock-Screen Web Push with Call Action Buttons
+    # 2. High-Urgency Web Push for Locked Devices
     call_url = f"/calling?room={req.room_id}&type={clean_call_type}&autoJoin=true"
 
     if req.target_user_id:
@@ -194,11 +191,8 @@ async def initiate_call(
 @router.post("/decline")
 async def decline_call(
     req: DeclineCallRequest,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
 ):
-    r_key = str(req.room_id).lower()
-
     if current_user.tenant_id:
         await manager.broadcast_to_tenant(
             str(current_user.tenant_id).lower(),
@@ -209,19 +203,6 @@ async def decline_call(
                 "declined_by_name": current_user.full_name,
             },
         )
-
-    # Dismiss ringing lock screen notification on caller's and target's devices
-    if current_user.tenant_id:
-        background_tasks.add_task(
-            dispatch_push_to_users,
-            user_ids=[current_user.id],
-            title="",
-            body="",
-            url="/",
-            tag=f"call-{r_key}",
-            data={"type": "CALL_DISMISSED", "room_id": req.room_id},
-        )
-
     return {"status": "declined"}
 
 
@@ -242,20 +223,20 @@ async def end_call(
             try:
                 await conn.send_json({
                     "type": "meeting-ended-by-host",
-                    "message": "The meeting was ended by the President / Host.",
+                    "message": "The meeting was ended.",
                 })
             except Exception:
                 pass
         call_rooms[r_key].clear()
         del call_rooms[r_key]
 
-    # Check for Missed Call in direct calls
+    # Missed Call Detection for 1-on-1 Calls
     session = active_call_sessions.pop(r_key, None)
     if session and session.get("target_user_id"):
         target_uid = session["target_user_id"]
         answered_set = session.get("answered_user_ids", set())
 
-        # If recipient never joined the call before caller ended it -> MISSED CALL!
+        # If target user never connected to room websocket -> Trigger MISSED CALL!
         if str(target_uid).lower() not in answered_set:
             background_tasks.add_task(
                 dispatch_push_to_users,
@@ -263,7 +244,7 @@ async def end_call(
                 title="❌ Missed Call",
                 body=f"You missed a {session['call_type']} call from {session['caller_name']}.",
                 url="/calling",
-                tag=f"missed-call-{r_key}",
+                tag=f"call-{r_key}",  # Replaces the incoming call tag directly!
                 badge_count=1,
                 data={
                     "type": "MISSED_CALL",
@@ -273,7 +254,6 @@ async def end_call(
                 },
             )
 
-    # Dismiss any active ringing notification from all members' lock screens
     if current_user.tenant_id:
         await manager.broadcast_to_tenant(
             str(current_user.tenant_id).lower(),
