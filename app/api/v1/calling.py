@@ -31,7 +31,7 @@ CALL_HOST_ROLES = [
 
 class InitiateCallRequest(BaseModel):
     room_id: str
-    call_type: str = "video"
+    call_type: str = "video"  # "video" or "audio"
     target_user_id: Optional[uuid.UUID] = None
 
 
@@ -85,11 +85,15 @@ async def initiate_call(
     r_key = str(req.room_id).lower()
     clean_call_type = req.call_type.lower()
 
-    call_room_meta[r_key] = {
-        "call_type": clean_call_type,
-        "host_id": str(current_user.id),
-        "is_direct": bool(req.target_user_id),
-    }
+    # If meeting already active, retain room metadata and call_type
+    if r_key not in call_room_meta:
+        call_room_meta[r_key] = {
+            "call_type": clean_call_type,
+            "host_id": str(current_user.id),
+            "is_direct": bool(req.target_user_id),
+        }
+    else:
+        clean_call_type = call_room_meta[r_key].get("call_type", clean_call_type)
 
     target_user_name = None
     if req.target_user_id:
@@ -266,7 +270,6 @@ async def webrtc_signaling_endpoint(
                     )
                 break
 
-            # Host Control: Force Mute Peer Mic
             if msg_type == "host-mute-peer" and is_host:
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
@@ -276,7 +279,6 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            # Host Control: Force Turn Off Peer Camera
             if msg_type == "host-stop-video-peer" and is_host:
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
@@ -286,7 +288,6 @@ async def webrtc_signaling_endpoint(
                             pass
                 continue
 
-            # Host Control: Force Kick Peer from Meeting
             if msg_type == "host-kick-peer" and is_host:
                 for conn, info in list(call_rooms[r_key].items()):
                     if info["user_id"] == target_peer_id:
