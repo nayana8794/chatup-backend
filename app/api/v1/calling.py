@@ -77,6 +77,32 @@ async def get_active_club_call(
     }
 
 
+# FIX A: Active Call Status Verification Endpoint for Mobile Clients
+@router.get("/room-status")
+async def get_room_call_status(
+    room_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    r_key = str(room_id).lower()
+    is_active = False
+
+    # A room is only truly active if it has active WebSockets connected or active host session
+    if r_key in call_rooms and len(call_rooms[r_key]) > 0:
+        is_active = True
+    elif r_key in active_call_sessions:
+        # Check if call was created within last 60 seconds (ringing window)
+        created_at = active_call_sessions[r_key].get("created_at")
+        if created_at and (datetime.utcnow().replace(tzinfo=None) - created_at).total_seconds() < 60:
+            is_active = True
+
+    meta = call_room_meta.get(r_key, {})
+    return {
+        "is_active": is_active,
+        "room_id": room_id,
+        "call_type": meta.get("call_type", "video"),
+    }
+
+
 @router.post("/initiate")
 async def initiate_call(
     req: InitiateCallRequest,
@@ -136,10 +162,10 @@ async def initiate_call(
         "target_user_name": target_user_name,
     }
 
-    # 1. Live WebSocket broadcast
+    # 1. Real-time WebSocket Broadcast
     await manager.broadcast_to_tenant(tenant_id_str, payload)
 
-    # 2. High-Urgency Web Push for Locked Devices
+    # 2. Universal iOS / Android Web Push Dispatch
     call_url = f"/calling?room={req.room_id}&type={clean_call_type}&autoJoin=true"
 
     if req.target_user_id:
@@ -172,7 +198,7 @@ async def initiate_call(
             background_tasks.add_task(
                 dispatch_push_to_users,
                 user_ids=list(club_members),
-                title="🦁 Live Club Meeting Started",
+                title="🦁 Live Club Meeting",
                 body=f"{current_user.full_name} started a {clean_call_type} meeting. Tap to join.",
                 url=call_url,
                 tag=f"call-{r_key}",
@@ -230,13 +256,12 @@ async def end_call(
         call_rooms[r_key].clear()
         del call_rooms[r_key]
 
-    # Missed Call Detection for 1-on-1 Calls
+    # Handle Missed Calls
     session = active_call_sessions.pop(r_key, None)
     if session and session.get("target_user_id"):
         target_uid = session["target_user_id"]
         answered_set = session.get("answered_user_ids", set())
 
-        # If target user never connected to room websocket -> Trigger MISSED CALL!
         if str(target_uid).lower() not in answered_set:
             background_tasks.add_task(
                 dispatch_push_to_users,
@@ -244,7 +269,7 @@ async def end_call(
                 title="❌ Missed Call",
                 body=f"You missed a {session['call_type']} call from {session['caller_name']}.",
                 url="/calling",
-                tag=f"call-{r_key}",  # Replaces the incoming call tag directly!
+                tag=f"call-{r_key}",
                 badge_count=1,
                 data={
                     "type": "MISSED_CALL",
@@ -298,7 +323,6 @@ async def webrtc_signaling_endpoint(
     if r_key not in call_rooms:
         call_rooms[r_key] = {}
 
-    # Mark user as having answered the call
     if r_key in active_call_sessions:
         active_call_sessions[r_key]["answered_user_ids"].add(str(user_id).lower())
 
