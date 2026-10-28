@@ -6,7 +6,13 @@ from typing import List, Optional
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
-from pywebpush import webpush, WebPushException
+
+# Safe Import to prevent server crash if package is temporarily building
+try:
+    from pywebpush import webpush, WebPushException
+except ImportError:
+    webpush = None
+    WebPushException = Exception
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -17,6 +23,10 @@ logger = logging.getLogger("uvicorn.error")
 
 def _send_single_notification(subscription_info: dict, payload_data: str) -> Optional[str]:
     """Synchronous pywebpush sender run in a thread."""
+    if not webpush:
+        logger.warning("pywebpush library is not installed in the environment.")
+        return None
+
     if not settings.VAPID_PRIVATE_KEY or not settings.VAPID_PUBLIC_KEY:
         return None
 
@@ -30,7 +40,7 @@ def _send_single_notification(subscription_info: dict, payload_data: str) -> Opt
         return None
     except WebPushException as ex:
         # HTTP 404 or 410 indicates the client unsubscribed or token expired
-        if ex.response is not None and ex.response.status_code in (404, 410):
+        if hasattr(ex, "response") and ex.response is not None and ex.response.status_code in (404, 410):
             return subscription_info.get("endpoint")
         logger.warning("WebPush delivery failure: %s", str(ex))
         return None
@@ -83,7 +93,6 @@ async def dispatch_push_to_users(
                     "auth": sub.auth,
                 },
             }
-            # Execute in default thread pool to avoid blocking asyncio loop
             dead_ep = await asyncio.to_thread(_send_single_notification, sub_info, payload)
             if dead_ep:
                 dead_endpoints.append(dead_ep)
