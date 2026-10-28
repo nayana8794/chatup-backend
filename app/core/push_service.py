@@ -7,7 +7,6 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
-# Safe Import to prevent server crash if package is temporarily building
 try:
     from pywebpush import webpush, WebPushException
 except ImportError:
@@ -22,7 +21,7 @@ logger = logging.getLogger("uvicorn.error")
 
 
 def _send_single_notification(subscription_info: dict, payload_data: str) -> Optional[str]:
-    """Synchronous pywebpush sender run in a thread."""
+    """Synchronous pywebpush sender run in a thread with High Urgency."""
     if not webpush:
         logger.warning("pywebpush library is not installed in the environment.")
         return None
@@ -31,15 +30,20 @@ def _send_single_notification(subscription_info: dict, payload_data: str) -> Opt
         return None
 
     try:
+        # High urgency & TTL bypasses Android Doze Mode and Apple APNs power-saving
         webpush(
             subscription_info=subscription_info,
             data=payload_data,
             vapid_private_key=settings.VAPID_PRIVATE_KEY,
             vapid_claims={"sub": settings.VAPID_CLAIM_EMAIL},
+            headers={
+                "Urgency": "high",
+                "TTL": "86400",
+            },
+            ttl=86400,
         )
         return None
     except WebPushException as ex:
-        # HTTP 404 or 410 indicates the client unsubscribed or token expired
         if hasattr(ex, "response") and ex.response is not None and ex.response.status_code in (404, 410):
             return subscription_info.get("endpoint")
         logger.warning("WebPush delivery failure: %s", str(ex))
@@ -55,11 +59,12 @@ async def dispatch_push_to_users(
     body: str,
     url: str = "/",
     tag: Optional[str] = None,
+    badge_count: int = 1,
     data: Optional[dict] = None,
 ):
     """
     Asynchronously queries all device subscriptions for the given users
-    and dispatches Web Push notifications without blocking API execution.
+    and dispatches Web Push notifications with High Urgency and Icon Badges.
     """
     if not user_ids or not settings.VAPID_PRIVATE_KEY or not settings.VAPID_PUBLIC_KEY:
         return
@@ -71,6 +76,7 @@ async def dispatch_push_to_users(
         "tag": tag or "chatup-notification",
         "icon": "/pwa-192.png",
         "badge": "/pwa-192.png",
+        "badge_count": badge_count,
         "custom_data": data or {},
     })
 
