@@ -2,13 +2,14 @@
 import uuid
 from datetime import datetime
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.ws_manager import manager
+from app.core.push_service import dispatch_push_to_users
 from app.models.user import User, UserRole
 from app.models.poll import Poll, PollOption, PollVoter, PollType, PollStatus
 from app.schemas.poll import (
@@ -29,6 +30,45 @@ ELECTION_MANAGERS = [
 ]
 
 
+@router.get("/pending-count")
+async def get_user_pending_polls_count(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lightweight query returning the number of active ballots the member has NOT yet voted in.
+    Powers the real-time red badge on the mobile bottom bar and dashboard.
+    """
+    if not current_user.tenant_id:
+        return {"pending_count": 0}
+
+    active_poll_ids = (
+        await db.execute(
+            select(Poll.id).where(
+                Poll.tenant_id == current_user.tenant_id,
+                Poll.status == PollStatus.ACTIVE,
+            )
+        )
+    ).scalars().all()
+
+    if not active_poll_ids:
+        return {"pending_count": 0}
+
+    voted_poll_ids = set(
+        (
+            await db.execute(
+                select(PollVoter.poll_id).where(
+                    PollVoter.user_id == current_user.id,
+                    PollVoter.poll_id.in_(active_poll_ids),
+                )
+            )
+        ).scalars().all()
+    )
+
+    pending_count = len(active_poll_ids) - len(voted_poll_ids)
+    return {"pending_count": max(0, pending_count)}
+
+
 @router.get("", response_model=List[PollResponse])
 async def list_club_polls(
     current_user: User = Depends(get_current_user),
@@ -37,7 +77,6 @@ async def list_club_polls(
     if not current_user.tenant_id:
         return []
 
-    # Query polls for tenant with options
     query = (
         select(Poll)
         .where(Poll.tenant_id == current_user.tenant_id)
@@ -46,7 +85,6 @@ async def list_club_polls(
     result = await db.execute(query)
     polls = result.scalars().all()
 
-    # Query which polls the current user has already voted in
     voted_poll_ids = set(
         (
             await db.execute(
@@ -106,6 +144,7 @@ async def list_club_polls(
 @router.post("", response_model=PollResponse)
 async def create_club_poll(
     req: PollCreateRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -143,7 +182,7 @@ async def create_club_poll(
     await db.commit()
     await db.refresh(poll)
 
-    # Realtime WebSocket Broadcast to all club members
+    # 1. Realtime WebSocket Broadcast
     if current_user.tenant_id:
         await manager.broadcast_to_tenant(
             str(current_user.tenant_id).lower(),
@@ -154,6 +193,28 @@ async def create_club_poll(
                 "is_secret": poll.is_secret,
             },
         )
+
+        # 2. Push Notification to All Club Members' Lock Screens
+        all_member_ids = (
+            await db.execute(
+                select(User.id).where(
+                    User.tenant_id == current_user.tenant_id,
+                    User.id != current_user.id,
+                    User.is_active == True,
+                )
+            )
+        ).scalars().all()
+
+        if all_member_ids:
+            background_tasks.add_task(
+                dispatch_push_to_users,
+                user_ids=list(all_member_ids),
+                title="🗳️ Secret Ballot Opened",
+                body=f"Official voting open: '{poll.title}'. Cast your anonymous ballot.",
+                url="/voting",
+                tag=f"poll-{str(poll.id)}",
+                badge_count=1,
+            )
 
     opts_res = await db.execute(
         select(PollOption).where(PollOption.poll_id == poll.id).order_by(PollOption.order_index)
@@ -207,7 +268,6 @@ async def cast_secret_vote(
         await db.commit()
         raise HTTPException(status_code=400, detail="Voting deadline has passed")
 
-    # Enforce One Member = One Vote
     existing_voter = (
         await db.execute(
             select(PollVoter).where(PollVoter.poll_id == poll_id, PollVoter.user_id == current_user.id)
@@ -220,7 +280,6 @@ async def cast_secret_vote(
     if poll.poll_type == PollType.SINGLE_CHOICE and len(req.selected_option_ids) > 1:
         raise HTTPException(status_code=400, detail="Only single selection is permitted for this ballot")
 
-    # Increment option vote counts atomically
     opts_res = await db.execute(
         select(PollOption).where(
             PollOption.poll_id == poll_id,
@@ -234,11 +293,9 @@ async def cast_secret_vote(
     for opt in valid_options:
         opt.vote_count += 1
 
-    # Record voter receipt (mathematically detached from selected options for anonymity)
     db.add(PollVoter(poll_id=poll_id, user_id=current_user.id, voted_at=now))
     await db.commit()
 
-    # Realtime turn-out update broadcast
     if poll.tenant_id:
         await manager.broadcast_to_tenant(
             str(poll.tenant_id).lower(),
@@ -254,6 +311,7 @@ async def cast_secret_vote(
 @router.post("/{poll_id}/close", response_model=PollResponse)
 async def close_club_poll(
     poll_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -278,6 +336,26 @@ async def close_club_poll(
                 "title": poll.title,
             },
         )
+
+        all_member_ids = (
+            await db.execute(
+                select(User.id).where(
+                    User.tenant_id == poll.tenant_id,
+                    User.is_active == True,
+                )
+            )
+        ).scalars().all()
+
+        if all_member_ids:
+            background_tasks.add_task(
+                dispatch_push_to_users,
+                user_ids=list(all_member_ids),
+                title="🏆 Election Results Certified",
+                body=f"Voting concluded for '{poll.title}'. Tap to view certified results.",
+                url="/voting",
+                tag=f"poll-result-{str(poll.id)}",
+                badge_count=0,
+            )
 
     opts_res = await db.execute(
         select(PollOption).where(PollOption.poll_id == poll.id).order_by(PollOption.order_index)
