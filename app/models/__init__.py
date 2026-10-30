@@ -7,6 +7,7 @@ from app.models.event import Event, EventRSVP, EventType, RSVPStatus
 from app.models.financial import DuesInvoice, ClubTransaction, DuesStatus, TransactionType
 from app.models.social import SocialPost, PostLike, PostComment
 from app.models.push_subscription import PushSubscription
+from app.models.poll import Poll, PollOption, PollVoter, PollType, PollStatus
 
 __all__ = [
     "Tenant",
@@ -32,4 +33,10 @@ __all__ = [
     "PostLike",
     "PostComment",
     "PushSubscription",
+    "Poll",
+    "PollOption",
+    "PollVoter",
+    "PollType",
+    "PollStatus"
+
 ]
