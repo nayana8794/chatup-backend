@@ -1,9 +1,11 @@
+# chatup/backend/app/api/v1/admin.py
 import uuid
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm.attributes import flag_modified
+
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.security import get_password_hash, generate_temporary_password
@@ -23,29 +25,72 @@ from app.schemas.tenant import (
 
 router = APIRouter(prefix="/admin", tags=["Super Admin Console"])
 
+
 async def verify_super_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != UserRole.SUPER_ADMIN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="මෙම පිටුවට පිවිසීමට Super Admin බලතල අවශ්‍ය වේ",
+            detail="Super Admin privileges are required to access this resource",
         )
     return current_user
 
-@router.get("/clubs", response_model=List[ClubResponse])
-async def list_all_clubs(
+
+@router.get("/stats")
+async def get_platform_telemetry(
     _: User = Depends(verify_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    # Club සහ Member Count ලබා ගැනීම
+    total_clubs = (await db.execute(select(func.count(Tenant.id)))).scalar_one() or 0
+    active_clubs = (
+        await db.execute(select(func.count(Tenant.id)).where(Tenant.is_active == True))
+    ).scalar_one() or 0
+    total_members = (await db.execute(select(func.count(User.id)))).scalar_one() or 0
+    total_presidents = (
+        await db.execute(select(func.count(User.id)).where(User.role == UserRole.PRESIDENT))
+    ).scalar_one() or 0
+
+    return {
+        "total_clubs": total_clubs,
+        "active_clubs": active_clubs,
+        "suspended_clubs": total_clubs - active_clubs,
+        "total_members": total_members,
+        "total_presidents": total_presidents,
+        "subscription_health": "100%",
+        "system_status": "Healthy",
+    }
+
+
+@router.get("/clubs", response_model=List[ClubResponse])
+async def list_all_clubs(
+    search: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None),
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
     query = (
         select(Tenant, func.count(User.id).label("member_count"))
         .outerjoin(User, Tenant.id == User.tenant_id)
         .group_by(Tenant.id)
-        .order_by(Tenant.name)
+        .order_by(Tenant.name.asc())
     )
+
+    if search:
+        s = f"%{search.strip().lower()}%"
+        query = query.where(
+            or_(
+                func.lower(Tenant.name).like(s),
+                func.lower(Tenant.slug).like(s),
+                func.lower(Tenant.district).like(s),
+            )
+        )
+
+    if status_filter == "active":
+        query = query.where(Tenant.is_active == True)
+    elif status_filter == "suspended":
+        query = query.where(Tenant.is_active == False)
+
     result = await db.execute(query)
-    
-    # සියලුම Presidents ලා ලබා ගැනීම
+
     presidents_res = await db.execute(select(User).where(User.role == UserRole.PRESIDENT))
     presidents = presidents_res.scalars().all()
     presidents_map = {p.tenant_id: p for p in presidents}
@@ -79,26 +124,39 @@ async def list_all_clubs(
         )
     return clubs_data
 
+
 @router.post("/clubs", response_model=ClubResponse)
 async def create_new_club(
     club_in: ClubCreateRequest,
     _: User = Depends(verify_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    existing_tenant = (await db.execute(select(Tenant).where(Tenant.slug == club_in.slug))).scalar_one_or_none()
+    existing_tenant = (
+        await db.execute(select(Tenant).where(Tenant.slug == club_in.slug))
+    ).scalar_one_or_none()
     if existing_tenant:
-        raise HTTPException(status_code=400, detail="මෙම Club Slug එක දැනටමත් පවතී")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Club workspace with identifier '{club_in.slug}' already exists",
+        )
 
     if club_in.president_email:
-        existing_user = (await db.execute(select(User).where(User.email == club_in.president_email))).scalar_one_or_none()
+        existing_user = (
+            await db.execute(select(User).where(User.email == club_in.president_email))
+        ).scalar_one_or_none()
         if existing_user:
-            raise HTTPException(status_code=400, detail="මෙම Email ලිපිනය සහිත පරිශීලකයෙක් දැනටමත් පවතී")
+            raise HTTPException(
+                status_code=400,
+                detail=f"A user with email '{club_in.president_email}' is already registered",
+            )
 
     new_club = Tenant(
         name=club_in.name,
         slug=club_in.slug,
         district=club_in.district,
-        features=club_in.features.model_dump() if club_in.features else {
+        features=club_in.features.model_dump()
+        if club_in.features
+        else {
             "video_calls": True,
             "mom_editor": True,
             "social_feed": True,
@@ -162,6 +220,7 @@ async def create_new_club(
         credentials=credentials_data,
     )
 
+
 @router.post("/clubs/{club_id}/initial-president", response_model=AssignPresidentResponse)
 async def assign_initial_president(
     club_id: uuid.UUID,
@@ -171,11 +230,16 @@ async def assign_initial_president(
 ):
     club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
     if not club:
-        raise HTTPException(status_code=404, detail="Club එක සොයාගත නොහැක")
+        raise HTTPException(status_code=404, detail="Club not found")
 
-    existing_user = (await db.execute(select(User).where(User.email == payload.email))).scalar_one_or_none()
+    existing_user = (
+        await db.execute(select(User).where(User.email == payload.email))
+    ).scalar_one_or_none()
     if existing_user:
-        raise HTTPException(status_code=400, detail="මෙම Email ලිපිනය දැනටමත් පවතී")
+        raise HTTPException(
+            status_code=400,
+            detail=f"A user with email '{payload.email}' is already registered",
+        )
 
     temp_pwd = generate_temporary_password()
     president = User(
@@ -199,10 +263,10 @@ async def assign_initial_president(
             president_name=president.full_name,
             email=president.email,
             temp_password=temp_pwd,
-        )
+        ),
     )
 
-# ================= RESET PRESIDENT PASSWORD =================
+
 @router.post("/clubs/{club_id}/reset-president-password", response_model=AssignPresidentResponse)
 async def reset_president_password(
     club_id: uuid.UUID,
@@ -211,9 +275,8 @@ async def reset_president_password(
 ):
     club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
     if not club:
-        raise HTTPException(status_code=404, detail="Club එක සොයාගත නොහැක")
+        raise HTTPException(status_code=404, detail="Club not found")
 
-    # එම Club එකේ President සොයා ගැනීම
     president = (
         await db.execute(
             select(User).where(User.tenant_id == club_id, User.role == UserRole.PRESIDENT)
@@ -221,16 +284,19 @@ async def reset_president_password(
     ).scalar_one_or_none()
 
     if not president:
-        raise HTTPException(status_code=404, detail="මෙම Club එක සඳහා President ගිණුමක් සොයාගත නොහැක")
+        raise HTTPException(
+            status_code=404,
+            detail="No President account found associated with this club workspace",
+        )
 
     temp_pwd = generate_temporary_password()
     president.hashed_password = get_password_hash(temp_pwd)
-    president.must_change_password = True  # නැවත Login වූ විට Password මාරු කිරීම අනිවාර්ය කරයි
+    president.must_change_password = True
 
     await db.commit()
 
     return AssignPresidentResponse(
-        message="President password reset successfully",
+        message="President temporary credentials generated successfully",
         credentials=CredentialsInfo(
             club_name=club.name,
             president_name=president.full_name,
@@ -239,7 +305,7 @@ async def reset_president_password(
         ),
     )
 
-# ================= EDIT PRESIDENT DETAILS =================
+
 @router.patch("/clubs/{club_id}/president", response_model=ClubPresidentInfo)
 async def update_president_details(
     club_id: uuid.UUID,
@@ -254,14 +320,17 @@ async def update_president_details(
     ).scalar_one_or_none()
 
     if not president:
-        raise HTTPException(status_code=404, detail="President ගිණුම සොයාගත නොහැක")
+        raise HTTPException(status_code=404, detail="President account not found")
 
     if payload.email and payload.email != president.email:
         existing = (
             await db.execute(select(User).where(User.email == payload.email, User.id != president.id))
         ).scalar_one_or_none()
         if existing:
-            raise HTTPException(status_code=400, detail="මෙම Email ලිපිනය දැනටමත් භාවිතයේ පවතී")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Email address '{payload.email}' is already in use by another user",
+            )
         president.email = payload.email
 
     if payload.full_name is not None:
@@ -274,6 +343,7 @@ async def update_president_details(
 
     return ClubPresidentInfo.model_validate(president)
 
+
 @router.patch("/clubs/{club_id}/features", response_model=ClubResponse)
 async def update_club_features(
     club_id: uuid.UUID,
@@ -283,17 +353,21 @@ async def update_club_features(
 ):
     club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
     if not club:
-        raise HTTPException(status_code=404, detail="Club එක සොයාගත නොහැක")
+        raise HTTPException(status_code=404, detail="Club not found")
 
     club.features = features_in.model_dump()
     flag_modified(club, "features")
     await db.commit()
     await db.refresh(club)
 
-    count = (await db.execute(select(func.count(User.id)).where(User.tenant_id == club_id))).scalar_one()
+    count = (
+        await db.execute(select(func.count(User.id)).where(User.tenant_id == club_id))
+    ).scalar_one()
 
     pres = (
-        await db.execute(select(User).where(User.tenant_id == club_id, User.role == UserRole.PRESIDENT))
+        await db.execute(
+            select(User).where(User.tenant_id == club_id, User.role == UserRole.PRESIDENT)
+        )
     ).scalar_one_or_none()
 
     return ClubResponse(
@@ -309,6 +383,7 @@ async def update_club_features(
         president=ClubPresidentInfo.model_validate(pres) if pres else None,
     )
 
+
 @router.patch("/clubs/{club_id}", response_model=ClubResponse)
 async def update_club_status(
     club_id: uuid.UUID,
@@ -318,7 +393,7 @@ async def update_club_status(
 ):
     club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
     if not club:
-        raise HTTPException(status_code=404, detail="Club එක සොයාගත නොහැක")
+        raise HTTPException(status_code=404, detail="Club not found")
 
     if club_update.name is not None:
         club.name = club_update.name
@@ -330,10 +405,14 @@ async def update_club_status(
     await db.commit()
     await db.refresh(club)
 
-    count = (await db.execute(select(func.count(User.id)).where(User.tenant_id == club_id))).scalar_one()
+    count = (
+        await db.execute(select(func.count(User.id)).where(User.tenant_id == club_id))
+    ).scalar_one()
 
     pres = (
-        await db.execute(select(User).where(User.tenant_id == club_id, User.role == UserRole.PRESIDENT))
+        await db.execute(
+            select(User).where(User.tenant_id == club_id, User.role == UserRole.PRESIDENT)
+        )
     ).scalar_one_or_none()
 
     return ClubResponse(
@@ -348,3 +427,19 @@ async def update_club_status(
         member_count=count,
         president=ClubPresidentInfo.model_validate(pres) if pres else None,
     )
+
+
+@router.delete("/clubs/{club_id}")
+async def delete_club_workspace(
+    club_id: uuid.UUID,
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club not found")
+
+    await db.delete(club)
+    await db.commit()
+
+    return {"status": "success", "message": f"Club workspace '{club.name}' successfully deleted"}
