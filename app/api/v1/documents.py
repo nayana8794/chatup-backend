@@ -21,13 +21,16 @@ logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/documents", tags=["Club Document & Certificate Repository"])
 
-DOCUMENT_MANAGERS = [
+BOARD_ROLES = [
     UserRole.SUPER_ADMIN,
     UserRole.PRESIDENT,
     UserRole.VICE_PRESIDENT,
     UserRole.SECRETARY,
     UserRole.VICE_SECRETARY,
+    UserRole.PLANNER,
+    UserRole.VICE_PLANNER,
     UserRole.TREASURER,
+    UserRole.VICE_TREASURER,
 ]
 
 
@@ -35,17 +38,26 @@ DOCUMENT_MANAGERS = [
 async def list_club_documents(
     category: Optional[DocumentCategory] = Query(None),
     search: Optional[str] = Query(None),
+    board_only: Optional[bool] = Query(None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     if not current_user.tenant_id:
         return []
 
+    is_board_member = current_user.role in BOARD_ROLES
+
     query = (
         select(ClubDocument, User.full_name)
         .outerjoin(User, ClubDocument.uploader_id == User.id)
         .where(ClubDocument.tenant_id == current_user.tenant_id)
     )
+
+    # Regular members can NEVER see board-only confidential documents
+    if not is_board_member:
+        query = query.where(ClubDocument.is_board_only == False)
+    elif board_only is not None:
+        query = query.where(ClubDocument.is_board_only == board_only)
 
     if category:
         query = query.where(ClubDocument.category == category)
@@ -77,6 +89,7 @@ async def list_club_documents(
             file_name=doc.file_name,
             file_size_bytes=doc.file_size_bytes,
             file_type=doc.file_type,
+            is_board_only=doc.is_board_only,
             created_at=doc.created_at,
         )
         for doc, uploader_name in rows
@@ -88,6 +101,7 @@ async def upload_club_document(
     title: str = Form(...),
     category: DocumentCategory = Form(DocumentCategory.GENERAL),
     description: Optional[str] = Form(None),
+    is_board_only: bool = Form(False),
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -95,7 +109,7 @@ async def upload_club_document(
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User does not belong to a club")
 
-    if current_user.role not in DOCUMENT_MANAGERS:
+    if current_user.role not in BOARD_ROLES:
         raise HTTPException(status_code=403, detail="Permission denied to upload official club documents")
 
     original_filename = file.filename or "document.pdf"
@@ -105,7 +119,6 @@ async def upload_club_document(
     file_size = len(file_bytes)
     await file.seek(0)
 
-    # Permanent Cloud CDN storage via Cloudinary
     try:
         upload_result = cloudinary.uploader.upload(
             file.file,
@@ -132,6 +145,7 @@ async def upload_club_document(
         file_name=original_filename,
         file_size_bytes=file_size,
         file_type=file_ext,
+        is_board_only=is_board_only,
         created_at=now,
         updated_at=now,
     )
@@ -139,7 +153,6 @@ async def upload_club_document(
     await db.commit()
     await db.refresh(doc)
 
-    # Real-time WebSocket Broadcast
     await manager.broadcast_to_tenant(
         str(current_user.tenant_id).lower(),
         {
@@ -147,6 +160,7 @@ async def upload_club_document(
             "document_id": str(doc.id),
             "title": doc.title,
             "category": doc.category.value,
+            "is_board_only": doc.is_board_only,
             "uploader_name": current_user.full_name,
         },
     )
@@ -163,6 +177,7 @@ async def upload_club_document(
         file_name=doc.file_name,
         file_size_bytes=doc.file_size_bytes,
         file_type=doc.file_type,
+        is_board_only=doc.is_board_only,
         created_at=doc.created_at,
     )
 
@@ -173,7 +188,7 @@ async def delete_club_document(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if current_user.role not in DOCUMENT_MANAGERS:
+    if current_user.role not in BOARD_ROLES:
         raise HTTPException(status_code=403, detail="Permission denied to delete club documents")
 
     doc = (

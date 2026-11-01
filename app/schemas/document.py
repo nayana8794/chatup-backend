@@ -18,6 +18,7 @@ class DocumentResponse(BaseModel):
     file_name: str
     file_size_bytes: int
     file_type: str
+    is_board_only: bool = False
     created_at: datetime
 
     class Config:
@@ -28,3 +29,4 @@ class DocumentUpdateRequest(BaseModel):
     title: Optional[str] = Field(None, min_length=2, max_length=255)
     description: Optional[str] = None
     category: Optional[DocumentCategory] = None
+    is_board_only: Optional[bool] = None

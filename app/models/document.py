@@ -2,7 +2,7 @@
 import uuid
 import enum
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Enum, Text
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Enum, Text, Boolean
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -32,6 +32,9 @@ class ClubDocument(Base):
     file_name = Column(String(255), nullable=False)
     file_size_bytes = Column(Integer, default=0, nullable=False)
     file_type = Column(String(50), nullable=False)
+
+    # Security Flag: Restrict viewing to Board Officers only
+    is_board_only = Column(Boolean, default=False, nullable=False, index=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
