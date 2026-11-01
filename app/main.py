@@ -18,6 +18,8 @@ from app.api.v1.calling import router as calling_router
 from app.api.v1.social import router as social_router
 from app.api.v1.push import router as push_router
 from app.api.v1.polls import router as polls_router
+from app.api.v1.documents import router as documents_router
+
 
 
 app = FastAPI(
@@ -60,6 +62,8 @@ app.include_router(calling_router, prefix="/api/v1")
 app.include_router(social_router, prefix="/api/v1")
 app.include_router(push_router, prefix="/api/v1/push")
 app.include_router(polls_router, prefix="/api/v1")
+app.include_router(polls_router, prefix="/api/v1")
+
 
 @app.get("/")
 def read_root():

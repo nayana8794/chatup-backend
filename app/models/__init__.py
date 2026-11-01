@@ -8,6 +8,7 @@ from app.models.financial import DuesInvoice, ClubTransaction, DuesStatus, Trans
 from app.models.social import SocialPost, PostLike, PostComment
 from app.models.push_subscription import PushSubscription
 from app.models.poll import Poll, PollOption, PollVoter, PollType, PollStatus
+from app.models.document import ClubDocument, DocumentCategory
 
 __all__ = [
     "Tenant",
@@ -37,6 +38,8 @@ __all__ = [
     "PollOption",
     "PollVoter",
     "PollType",
-    "PollStatus"
+    "PollStatus",
+    "ClubDocument",
+    "DocumentCategory"
 
 ]
