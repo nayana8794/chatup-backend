@@ -5,8 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+
 from app.core.database import get_db
 from app.core.config import settings
+
 from app.api.v1.auth import router as auth_router
 from app.api.v1.members import router as members_router
 from app.api.v1.admin import router as admin_router
@@ -62,8 +64,7 @@ app.include_router(calling_router, prefix="/api/v1")
 app.include_router(social_router, prefix="/api/v1")
 app.include_router(push_router, prefix="/api/v1/push")
 app.include_router(polls_router, prefix="/api/v1")
-app.include_router(polls_router, prefix="/api/v1")
-
+app.include_router(documents_router, prefix="/api/v1")
 
 @app.get("/")
 def read_root():
