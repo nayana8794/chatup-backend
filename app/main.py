@@ -21,6 +21,7 @@ from app.api.v1.social import router as social_router
 from app.api.v1.push import router as push_router
 from app.api.v1.polls import router as polls_router
 from app.api.v1.documents import router as documents_router
+from app.api.v1.bookkeeping import router as bookkeeping_router
 
 
 
@@ -65,6 +66,7 @@ app.include_router(social_router, prefix="/api/v1")
 app.include_router(push_router, prefix="/api/v1/push")
 app.include_router(polls_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
+app.include_router(bookkeeping_router, prefix="/api/v1")
 
 @app.get("/")
 def read_root():
