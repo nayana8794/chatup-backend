@@ -9,6 +9,7 @@ from sqlalchemy import text
 from app.core.database import get_db
 from app.core.config import settings
 
+# Router Imports
 from app.api.v1.auth import router as auth_router
 from app.api.v1.members import router as members_router
 from app.api.v1.admin import router as admin_router
@@ -24,12 +25,10 @@ from app.api.v1.documents import router as documents_router
 from app.api.v1.bookkeeping import router as bookkeeping_router
 from app.api.v1.financial_sheets import router as financial_sheets_router
 
-
-
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version="1.0.0",
-    description="SaaS Backend for Community Clubs"
+    description="SaaS Backend for Community Clubs",
 )
 
 # CORS configuration
@@ -54,7 +53,7 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(os.path.join(STATIC_DIR, "uploads"), exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# Include All Routers
+# Include All Routers with /api/v1 Prefix
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(members_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
@@ -64,15 +63,17 @@ app.include_router(events_router, prefix="/api/v1")
 app.include_router(financial_router, prefix="/api/v1")
 app.include_router(calling_router, prefix="/api/v1")
 app.include_router(social_router, prefix="/api/v1")
-app.include_router(push_router, prefix="/api/v1/push")
+app.include_router(push_router, prefix="/api/v1")
 app.include_router(polls_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
 app.include_router(bookkeeping_router, prefix="/api/v1")
 app.include_router(financial_sheets_router, prefix="/api/v1")
 
+
 @app.get("/")
 def read_root():
     return {"message": "Welcome to ChatUp API Platform (Live on Cloud)"}
+
 
 @app.get("/health/db")
 async def check_db_health(db: AsyncSession = Depends(get_db)):
