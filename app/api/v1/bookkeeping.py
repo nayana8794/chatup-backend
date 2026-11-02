@@ -8,6 +8,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, or_
+from sqlalchemy.orm import aliased
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -85,7 +86,7 @@ async def get_bookkeeping_summary(
         dues_collected = to_float(raw_dues_collected)
         dues_expected = to_float(raw_dues_expected)
 
-        # 2. General Ledger Transactions (Exclude DUES category to prevent double counting dues)
+        # 2. General Ledger Transactions (Exclude DUES category to avoid double counting)
         raw_other_income = (
             await db.execute(
                 select(func.coalesce(func.sum(ClubTransaction.amount), 0)).where(
@@ -228,7 +229,6 @@ async def record_transaction(
         now = datetime.utcnow().replace(tzinfo=None)
         tx_date = req.transaction_date.replace(tzinfo=None) if req.transaction_date else now
 
-        # Accurately matches the exact ClubTransaction model definition in financial.py
         tx = ClubTransaction(
             tenant_id=current_user.tenant_id,
             recorded_by=current_user.id,
@@ -322,7 +322,9 @@ async def export_excel_audit_package(
             bottom=Side(style="thin", color="CCCCCC"),
         )
 
+        # ----------------------------------------------------
         # SHEET 1: Summary
+        # ----------------------------------------------------
         ws1 = wb.active
         ws1.title = "Executive Summary"
         ws1.views.sheetView[0].showGridLines = True
@@ -391,17 +393,26 @@ async def export_excel_audit_package(
             ws1[f"B{row_idx}"].border = thin_border
             row_idx += 1
 
-        # SHEET 2: Dues Ledger
+        # ----------------------------------------------------
+        # SHEET 2: Dues Ledger (Safely Joined with User Table)
+        # ----------------------------------------------------
         ws2 = wb.create_sheet(title="Membership Dues Ledger")
         ws2.views.sheetView[0].showGridLines = True
 
-        invoices = (
-            await db.execute(
-                select(DuesInvoice)
-                .where(DuesInvoice.tenant_id == t_id, DuesInvoice.is_approved == True)
-                .order_by(DuesInvoice.member_name.asc())
+        VerifierUser = aliased(User)
+        dues_query = (
+            select(
+                DuesInvoice,
+                User.full_name.label("member_name"),
+                User.role.label("member_role"),
+                VerifierUser.full_name.label("verifier_name"),
             )
-        ).scalars().all()
+            .join(User, DuesInvoice.user_id == User.id)
+            .outerjoin(VerifierUser, DuesInvoice.verified_by == VerifierUser.id)
+            .where(DuesInvoice.tenant_id == t_id, DuesInvoice.is_approved == True)
+            .order_by(User.full_name.asc(), DuesInvoice.created_at.desc())
+        )
+        invoice_rows = (await db.execute(dues_query)).all()
 
         dues_headers = [
             "Member Full Name", "Role", "Billing Title", "Cycle",
@@ -416,23 +427,29 @@ async def export_excel_audit_package(
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
 
-        for inv in invoices:
+        for inv, member_name, member_role, verifier_name in invoice_rows:
             paid_date = inv.paid_at.strftime("%Y-%m-%d") if inv.paid_at else "-"
+            cycle_str = inv.billing_cycle.value if hasattr(inv.billing_cycle, 'value') else str(inv.billing_cycle)
+            status_str = inv.status.value if hasattr(inv.status, 'value') else str(inv.status)
+            role_str = member_role.value if hasattr(member_role, 'value') else str(member_role or "MEMBER")
+
             ws2.append([
-                inv.member_name,
-                inv.member_role,
+                member_name or "Club Member",
+                role_str,
                 inv.title,
-                inv.billing_cycle.value if hasattr(inv.billing_cycle, 'value') else str(inv.billing_cycle),
+                cycle_str,
                 to_float(inv.amount),
                 inv.due_date.strftime("%Y-%m-%d") if inv.due_date else "-",
-                inv.status.value if hasattr(inv.status, 'value') else str(inv.status),
-                inv.reference_number,
+                status_str,
+                inv.reference_number or "-",
                 paid_date,
                 inv.payment_method or "-",
-                inv.verifier_name or "-",
+                verifier_name or "-",
             ])
 
-        # SHEET 3: Transactions Journal
+        # ----------------------------------------------------
+        # SHEET 3: Transactions Journal (Safe created_at mapping)
+        # ----------------------------------------------------
         ws3 = wb.create_sheet(title="Income & Expense Journal")
         ws3.views.sheetView[0].showGridLines = True
 
@@ -455,16 +472,19 @@ async def export_excel_audit_package(
 
         for tx in txs:
             val = to_float(tx.amount)
+            type_str = tx.transaction_type.value if hasattr(tx.transaction_type, 'value') else str(tx.transaction_type)
             ws3.append([
-                tx.created_at.strftime("%Y-%m-%d"),
-                tx.transaction_type.value if hasattr(tx.transaction_type, 'value') else str(tx.transaction_type),
-                tx.category,
-                tx.title,
+                tx.created_at.strftime("%Y-%m-%d") if tx.created_at else "-",
+                type_str,
+                tx.category or "General",
+                tx.title or "-",
                 tx.notes or "-",
                 val if tx.transaction_type == TransactionType.INCOME else -val,
             ])
 
+        # ----------------------------------------------------
         # SHEET 4: Certificate
+        # ----------------------------------------------------
         ws4 = wb.create_sheet(title="Auditor Compliance Certificate")
         ws4.views.sheetView[0].showGridLines = True
 
@@ -484,9 +504,15 @@ async def export_excel_audit_package(
 
         for sheet in [ws1, ws2, ws3, ws4]:
             for col in sheet.columns:
-                max_len = max(len(str(cell.value or "")) for cell in col)
+                max_len = 0
+                for cell in col:
+                    val_str = str(cell.value or "")
+                    if "\n" in val_str:
+                        val_str = max(val_str.split("\n"), key=len)
+                    if len(val_str) > max_len:
+                        max_len = len(val_str)
                 col_letter = get_column_letter(col[0].column)
-                sheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
+                sheet.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 45)
 
         stream = io.BytesIO()
         wb.save(stream)
@@ -498,7 +524,10 @@ async def export_excel_audit_package(
         return Response(
             content=stream.getvalue(),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            },
         )
     except Exception as e:
         logger.error("Error generating Excel package: %s", str(e), exc_info=True)
