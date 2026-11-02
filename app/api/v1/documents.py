@@ -124,6 +124,7 @@ async def upload_club_document(
             file.file,
             folder=f"chatup_documents/{str(current_user.tenant_id).lower()}",
             resource_type="auto",
+            access_mode="public",
             use_filename=True,
             unique_filename=True,
         )
