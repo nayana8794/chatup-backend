@@ -9,6 +9,7 @@ from app.models.social import SocialPost, PostLike, PostComment
 from app.models.push_subscription import PushSubscription
 from app.models.poll import Poll, PollOption, PollVoter, PollType, PollStatus
 from app.models.document import ClubDocument, DocumentCategory
+from app.models.financial_sheet import FinancialSheet, SheetType, SheetStatus
 
 __all__ = [
     "Tenant",
@@ -40,6 +41,10 @@ __all__ = [
     "PollType",
     "PollStatus",
     "ClubDocument",
-    "DocumentCategory"
+    "DocumentCategory",
+    "FinancialSheet",
+    "SheetType",
+    "SheetStatus"
+
 
 ]
