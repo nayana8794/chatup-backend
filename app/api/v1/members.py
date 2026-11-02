@@ -2,7 +2,8 @@
 import uuid
 import secrets
 import string
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -10,7 +11,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_president
 from app.core.security import get_password_hash
 from app.models.tenant import Tenant
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, LanguagePreference
 from app.schemas.member import (
     MemberCreateRequest,
     MemberResponse,
@@ -19,10 +20,20 @@ from app.schemas.member import (
 
 router = APIRouter(prefix="/members", tags=["Member Management"])
 
+
+class MemberRoleUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone_number: Optional[str] = None
+    role: Optional[UserRole] = None
+    language: Optional[LanguagePreference] = None
+
+
 def generate_friendly_temp_password() -> str:
     chars = string.ascii_letters + string.digits
     random_str = "".join(secrets.choice(chars) for _ in range(6))
     return f"Lions@{random_str}"
+
 
 @router.post("", response_model=MemberCreatedWithTempPass)
 async def create_member(
@@ -30,15 +41,13 @@ async def create_member(
     president: User = Depends(get_current_president),
     db: AsyncSession = Depends(get_db),
 ):
-    # Email එක දැනටමත් තිබේදැයි පරීක්ෂා කිරීම
     existing_user = await db.execute(select(User).where(User.email == member_in.email))
     if existing_user.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="මෙම විද්‍යුත් තැපෑල දැනටමත් ලියාපදිංචි කර ඇත (Email already registered)",
+            detail="A user with this email address is already registered",
         )
 
-    # Tenant ID තීරණය කිරීම (Super Admin නම් පළමු club එකට assign කරයි, President නම් ඔහුගේ club එකට)
     tenant_id = president.tenant_id
     if not tenant_id and president.role == UserRole.SUPER_ADMIN:
         first_tenant = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
@@ -74,20 +83,68 @@ async def create_member(
         temp_password=temp_password,
     )
 
+
 @router.get("", response_model=List[MemberResponse])
 async def list_club_members(
     president: User = Depends(get_current_president),
     db: AsyncSession = Depends(get_db),
 ):
-    # Super Admin නම් පද්ධතියේ සියලු සාමාජිකයින් පෙන්වයි
     if president.role == UserRole.SUPER_ADMIN:
         query = select(User).order_by(User.full_name)
     else:
-        # President නම් ඔහුගේ Club එකේ සාමාජිකයින් පමණක් පෙන්වයි
         query = select(User).where(User.tenant_id == president.tenant_id).order_by(User.full_name)
 
     result = await db.execute(query)
     return result.scalars().all()
+
+
+# Promote / Demote / Edit Role without resetting account
+@router.patch("/{member_id}", response_model=MemberResponse)
+async def update_member_role_and_details(
+    member_id: uuid.UUID,
+    payload: MemberRoleUpdateRequest,
+    president: User = Depends(get_current_president),
+    db: AsyncSession = Depends(get_db),
+):
+    if president.role == UserRole.SUPER_ADMIN:
+        query = select(User).where(User.id == member_id)
+    else:
+        query = select(User).where(User.id == member_id, User.tenant_id == president.tenant_id)
+
+    member = (await db.execute(query)).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member account not found")
+
+    # Safety: President cannot demote themselves from here
+    if member.id == president.id and payload.role and payload.role != UserRole.PRESIDENT:
+        raise HTTPException(
+            status_code=400,
+            detail="President cannot change their own role. Presidential transfers are managed via Super Admin Console.",
+        )
+
+    # Validate duplicate email if email is changed
+    if payload.email and payload.email != member.email:
+        duplicate = (
+            await db.execute(select(User).where(User.email == payload.email, User.id != member_id))
+        ).scalar_one_or_none()
+        if duplicate:
+            raise HTTPException(status_code=400, detail="This email address is already in use by another member")
+        member.email = payload.email
+
+    if payload.full_name is not None:
+        member.full_name = payload.full_name.strip()
+    if payload.phone_number is not None:
+        member.phone_number = payload.phone_number.strip() if payload.phone_number else None
+    if payload.role is not None:
+        member.role = payload.role
+    if payload.language is not None:
+        member.language = payload.language
+
+    await db.commit()
+    await db.refresh(member)
+
+    return member
+
 
 @router.post("/{member_id}/reset-password", response_model=MemberCreatedWithTempPass)
 async def reset_member_password(
@@ -104,7 +161,7 @@ async def reset_member_password(
     member = result.scalar_one_or_none()
 
     if not member:
-        raise HTTPException(status_code=404, detail="සාමාජිකයා සොයාගත නොහැක (Member not found)")
+        raise HTTPException(status_code=404, detail="Member account not found")
 
     temp_password = generate_friendly_temp_password()
     member.hashed_password = get_password_hash(temp_password)
@@ -125,6 +182,7 @@ async def reset_member_password(
         temp_password=temp_password,
     )
 
+
 @router.delete("/{member_id}")
 async def delete_member(
     member_id: uuid.UUID,
@@ -140,11 +198,11 @@ async def delete_member(
     member = result.scalar_one_or_none()
 
     if not member:
-        raise HTTPException(status_code=404, detail="සාමාජිකයා සොයාගත නොහැක (Member not found)")
+        raise HTTPException(status_code=404, detail="Member account not found")
     
     if member.id == president.id:
-        raise HTTPException(status_code=400, detail="තමාගේම ගිණුම delete කළ නොහැක")
+        raise HTTPException(status_code=400, detail="You cannot delete your own President account")
 
     await db.delete(member)
     await db.commit()
-    return {"message": "සාමාජිකයා සාර්ථකව ඉවත් කරන ලදී (Member deleted successfully)"}
+    return {"message": "Member removed successfully"}
