@@ -5,7 +5,7 @@ from typing import List, Optional
 from pydantic import BaseModel, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, and_
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import get_db
@@ -63,10 +63,23 @@ async def get_platform_telemetry(
     active_clubs = (
         await db.execute(select(func.count(Tenant.id)).where(Tenant.is_active == True))
     ).scalar_one() or 0
-    total_members = (await db.execute(select(func.count(User.id)))).scalar_one() or 0
+
+    # Exclude Super Admin and Governors from platform club member count
+    total_members = (
+        await db.execute(
+            select(func.count(User.id)).where(
+                and_(
+                    User.role != UserRole.SUPER_ADMIN,
+                    User.role != UserRole.DISTRICT_GOVERNOR,
+                )
+            )
+        )
+    ).scalar_one() or 0
+
     total_presidents = (
         await db.execute(select(func.count(User.id)).where(User.role == UserRole.PRESIDENT))
     ).scalar_one() or 0
+
     total_governors = (
         await db.execute(select(func.count(User.id)).where(User.role == UserRole.DISTRICT_GOVERNOR))
     ).scalar_one() or 0
