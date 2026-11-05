@@ -24,6 +24,7 @@ from app.api.v1.polls import router as polls_router
 from app.api.v1.documents import router as documents_router
 from app.api.v1.bookkeeping import router as bookkeeping_router
 from app.api.v1.financial_sheets import router as financial_sheets_router
+from app.api.v1.governor import router as governor_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -68,6 +69,7 @@ app.include_router(polls_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
 app.include_router(bookkeeping_router, prefix="/api/v1")
 app.include_router(financial_sheets_router, prefix="/api/v1")
+app.include_router(governor_router, prefix="/api/v1")
 
 
 @app.get("/")
