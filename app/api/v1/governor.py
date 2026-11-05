@@ -4,7 +4,7 @@ import uuid
 import logging
 from datetime import datetime
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
@@ -14,11 +14,12 @@ import cloudinary.uploader
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.ws_manager import manager
-from app.core.push_service import dispatch_push_to_users
+from app.core.security import get_password_hash, generate_temporary_password
 from app.models.user import User, UserRole
 from app.models.tenant import Tenant
 from app.models.document import ClubDocument, DocumentCategory
 from app.models.event import Event, EventType
+from app.schemas.tenant import CredentialsInfo, AssignPresidentResponse
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -65,6 +66,14 @@ class DistrictEventCreateRequest(BaseModel):
     meeting_link: Optional[str] = None
 
 
+class GovernorClubOnboardRequest(BaseModel):
+    name: str = Field(..., min_length=3, max_length=255)
+    slug: str = Field(..., min_length=3, max_length=100)
+    president_name: str = Field(..., min_length=2, max_length=255)
+    president_email: EmailStr
+    president_phone: Optional[str] = None
+
+
 @router.get("/overview", response_model=RegionalOverviewResponse)
 async def get_regional_overview(
     current_user: User = Depends(verify_governor_or_admin),
@@ -73,9 +82,8 @@ async def get_regional_overview(
     district_filter = current_user.district
     if not district_filter and current_user.role == UserRole.SUPER_ADMIN:
         first_tenant = (await db.execute(select(Tenant).where(Tenant.district.isnot(None)).limit(1))).scalar_one_or_none()
-        district_filter = first_tenant.district if first_tenant else "District 107-N (Helsinki Metropolitan)"
+        district_filter = first_tenant.district if first_tenant else "District 107-N"
 
-    # Count clubs in district
     clubs_res = await db.execute(
         select(Tenant).where(Tenant.district == district_filter)
     )
@@ -84,7 +92,6 @@ async def get_regional_overview(
     active_clubs = sum(1 for c in clubs if c.is_active)
     club_ids = [c.id for c in clubs]
 
-    # Count members across all district clubs
     total_members = 0
     total_presidents = 0
     if club_ids:
@@ -104,7 +111,6 @@ async def get_regional_overview(
             )
         ).scalar_one() or 0
 
-    # Count district circulars issued by governor
     circulars_count = (
         await db.execute(
             select(func.count(ClubDocument.id)).where(
@@ -133,7 +139,7 @@ async def list_district_clubs(
     district_filter = current_user.district
     if not district_filter and current_user.role == UserRole.SUPER_ADMIN:
         first_tenant = (await db.execute(select(Tenant).where(Tenant.district.isnot(None)).limit(1))).scalar_one_or_none()
-        district_filter = first_tenant.district if first_tenant else "District 107-N (Helsinki Metropolitan)"
+        district_filter = first_tenant.district if first_tenant else "District 107-N"
 
     clubs_res = await db.execute(
         select(Tenant).where(Tenant.district == district_filter).order_by(Tenant.name.asc())
@@ -169,6 +175,89 @@ async def list_district_clubs(
     return items
 
 
+# District Governor onboards a new Club under their specific District
+@router.post("/clubs", response_model=AssignPresidentResponse)
+async def governor_onboard_club(
+    payload: GovernorClubOnboardRequest,
+    current_user: User = Depends(verify_governor_or_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    district_name = current_user.district
+    if not district_name and current_user.role == UserRole.SUPER_ADMIN:
+        district_name = "District 107-N"
+
+    # 1. Validate slug uniqueness
+    clean_slug = payload.slug.lower().strip()
+    existing_tenant = (
+        await db.execute(select(Tenant).where(Tenant.slug == clean_slug))
+    ).scalar_one_or_none()
+    if existing_tenant:
+        raise HTTPException(status_code=400, detail=f"Club workspace slug '{clean_slug}' already exists")
+
+    # 2. Validate email uniqueness
+    clean_email = payload.president_email.lower().strip()
+    existing_user = (
+        await db.execute(select(User).where(User.email == clean_email))
+    ).scalar_one_or_none()
+    if existing_user:
+        raise HTTPException(status_code=400, detail=f"Email address '{clean_email}' is already registered")
+
+    now = datetime.utcnow().replace(tzinfo=None)
+
+    # 3. Create club workspace chartered under this governor's district
+    new_club = Tenant(
+        id=uuid.uuid4(),
+        name=payload.name.strip(),
+        slug=clean_slug,
+        district=district_name,
+        features={
+            "video_calls": True,
+            "mom_editor": True,
+            "social_feed": True,
+            "dues_module": True,
+            "max_members": 50,
+        },
+        theme_config={
+            "primary_color": "#002F6C",
+            "secondary_color": "#F2A900",
+            "dark_mode": False,
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(new_club)
+    await db.flush()
+
+    # 4. Appoint Inaugural Club President
+    temp_pwd = generate_temporary_password()
+    president = User(
+        id=uuid.uuid4(),
+        tenant_id=new_club.id,
+        full_name=payload.president_name.strip(),
+        email=clean_email,
+        phone_number=payload.president_phone.strip() if payload.president_phone else None,
+        hashed_password=get_password_hash(temp_pwd),
+        role=UserRole.PRESIDENT,
+        district=district_name,
+        is_active=True,
+        must_change_password=True,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(president)
+    await db.commit()
+
+    return AssignPresidentResponse(
+        message=f"Club '{new_club.name}' successfully chartered under {district_name}",
+        credentials=CredentialsInfo(
+            club_name=new_club.name,
+            president_name=president.full_name,
+            email=president.email,
+            temp_password=temp_pwd,
+        ),
+    )
+
+
 # Broadcast District Circular (Piirikirje) to ALL clubs in District
 @router.post("/circulars")
 async def broadcast_district_circular(
@@ -181,7 +270,7 @@ async def broadcast_district_circular(
     district_filter = current_user.district
     if not district_filter and current_user.role == UserRole.SUPER_ADMIN:
         first_tenant = (await db.execute(select(Tenant).where(Tenant.district.isnot(None)).limit(1))).scalar_one_or_none()
-        district_filter = first_tenant.district if first_tenant else "District 107-N (Helsinki Metropolitan)"
+        district_filter = first_tenant.district if first_tenant else "District 107-N"
 
     clubs_res = await db.execute(select(Tenant).where(Tenant.district == district_filter))
     district_clubs = clubs_res.scalars().all()
@@ -214,7 +303,7 @@ async def broadcast_district_circular(
 
     now = datetime.utcnow().replace(tzinfo=None)
 
-    # Distribute copy into the Document Repository of EVERY club in the district
+    # Distribute into Document Repository of every club in district
     for c in district_clubs:
         doc = ClubDocument(
             tenant_id=c.id,
@@ -234,7 +323,6 @@ async def broadcast_district_circular(
 
     await db.commit()
 
-    # Broadcast WebSocket notification to all clubs in district
     for c in district_clubs:
         try:
             await manager.broadcast_to_tenant(
@@ -256,7 +344,7 @@ async def broadcast_district_circular(
     }
 
 
-# Schedule District Convention / Cabinet Meeting across all clubs in district
+# Schedule District Convention across all clubs in district
 @router.post("/events")
 async def schedule_district_convention(
     req: DistrictEventCreateRequest,
@@ -266,7 +354,7 @@ async def schedule_district_convention(
     district_filter = current_user.district
     if not district_filter and current_user.role == UserRole.SUPER_ADMIN:
         first_tenant = (await db.execute(select(Tenant).where(Tenant.district.isnot(None)).limit(1))).scalar_one_or_none()
-        district_filter = first_tenant.district if first_tenant else "District 107-N (Helsinki Metropolitan)"
+        district_filter = first_tenant.district if first_tenant else "District 107-N"
 
     clubs_res = await db.execute(select(Tenant).where(Tenant.district == district_filter))
     district_clubs = clubs_res.scalars().all()

@@ -1,6 +1,8 @@
 # chatup/backend/app/api/v1/admin.py
 import uuid
+from datetime import datetime
 from typing import List, Optional
+from pydantic import BaseModel, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
@@ -35,6 +37,23 @@ async def verify_super_admin(current_user: User = Depends(get_current_user)) -> 
     return current_user
 
 
+class GovernorCreateRequest(BaseModel):
+    full_name: str
+    email: EmailStr
+    phone_number: Optional[str] = None
+    district: str
+
+
+class GovernorResponse(BaseModel):
+    id: uuid.UUID
+    full_name: str
+    email: str
+    phone_number: Optional[str] = None
+    district: str
+    is_active: bool
+    created_at: datetime
+
+
 @router.get("/stats")
 async def get_platform_telemetry(
     _: User = Depends(verify_super_admin),
@@ -48,6 +67,9 @@ async def get_platform_telemetry(
     total_presidents = (
         await db.execute(select(func.count(User.id)).where(User.role == UserRole.PRESIDENT))
     ).scalar_one() or 0
+    total_governors = (
+        await db.execute(select(func.count(User.id)).where(User.role == UserRole.DISTRICT_GOVERNOR))
+    ).scalar_one() or 0
 
     return {
         "total_clubs": total_clubs,
@@ -55,11 +77,115 @@ async def get_platform_telemetry(
         "suspended_clubs": total_clubs - active_clubs,
         "total_members": total_members,
         "total_presidents": total_presidents,
+        "total_governors": total_governors,
         "subscription_health": "100%",
         "system_status": "Healthy",
     }
 
 
+# ================= DISTRICT GOVERNORS MANAGEMENT =================
+@router.get("/governors", response_model=List[GovernorResponse])
+async def list_district_governors(
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    query = (
+        select(User)
+        .where(User.role == UserRole.DISTRICT_GOVERNOR)
+        .order_by(User.full_name.asc())
+    )
+    result = await db.execute(query)
+    governors = result.scalars().all()
+    return [
+        GovernorResponse(
+            id=g.id,
+            full_name=g.full_name,
+            email=g.email,
+            phone_number=g.phone_number,
+            district=g.district or "Unassigned District",
+            is_active=g.is_active,
+            created_at=g.created_at,
+        )
+        for g in governors
+    ]
+
+
+@router.post("/governors", response_model=AssignPresidentResponse)
+async def create_district_governor(
+    payload: GovernorCreateRequest,
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    existing = (
+        await db.execute(select(User).where(User.email == payload.email.lower().strip()))
+    ).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="A user with this email address already exists")
+
+    temp_pwd = generate_temporary_password()
+    now = datetime.utcnow().replace(tzinfo=None)
+    governor = User(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        full_name=payload.full_name.strip(),
+        email=payload.email.lower().strip(),
+        phone_number=payload.phone_number.strip() if payload.phone_number else None,
+        hashed_password=get_password_hash(temp_pwd),
+        role=UserRole.DISTRICT_GOVERNOR,
+        district=payload.district.strip(),
+        is_active=True,
+        must_change_password=True,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(governor)
+    await db.commit()
+
+    return AssignPresidentResponse(
+        message=f"District Governor appointed successfully for {payload.district}",
+        credentials=CredentialsInfo(
+            club_name=payload.district,
+            president_name=governor.full_name,
+            email=governor.email,
+            temp_password=temp_pwd,
+        ),
+    )
+
+
+@router.post("/governors/{governor_id}/reset-password", response_model=AssignPresidentResponse)
+async def reset_governor_password(
+    governor_id: uuid.UUID,
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    governor = (
+        await db.execute(
+            select(User).where(User.id == governor_id, User.role == UserRole.DISTRICT_GOVERNOR)
+        )
+    ).scalar_one_or_none()
+
+    if not governor:
+        raise HTTPException(status_code=404, detail="District Governor account not found")
+
+    temp_pwd = generate_temporary_password()
+    governor.hashed_password = get_password_hash(temp_pwd)
+    governor.must_change_password = True
+    governor.updated_at = datetime.utcnow().replace(tzinfo=None)
+
+    await db.commit()
+
+    return AssignPresidentResponse(
+        message="Governor temporary credentials regenerated successfully",
+        credentials=CredentialsInfo(
+            club_name=governor.district or "District Jurisdiction",
+            president_name=governor.full_name,
+            email=governor.email,
+            temp_password=temp_pwd,
+        ),
+    )
+
+
+# ================= CLUB WORKSPACES DIRECTORY & MANAGEMENT =================
 @router.get("/clubs", response_model=List[ClubResponse])
 async def list_all_clubs(
     search: Optional[str] = Query(None),
@@ -150,6 +276,7 @@ async def create_new_club(
                 detail=f"A user with email '{club_in.president_email}' is already registered",
             )
 
+    now = datetime.utcnow().replace(tzinfo=None)
     new_club = Tenant(
         name=club_in.name,
         slug=club_in.slug,
@@ -168,6 +295,8 @@ async def create_new_club(
             "secondary_color": "#F2A900",
             "dark_mode": False,
         },
+        created_at=now,
+        updated_at=now,
     )
     db.add(new_club)
     await db.flush()
@@ -187,6 +316,8 @@ async def create_new_club(
             role=UserRole.PRESIDENT,
             is_active=True,
             must_change_password=True,
+            created_at=now,
+            updated_at=now,
         )
         db.add(president)
         credentials_data = CredentialsInfo(
@@ -241,6 +372,7 @@ async def assign_initial_president(
             detail=f"A user with email '{payload.email}' is already registered",
         )
 
+    now = datetime.utcnow().replace(tzinfo=None)
     temp_pwd = generate_temporary_password()
     president = User(
         id=uuid.uuid4(),
@@ -252,6 +384,8 @@ async def assign_initial_president(
         role=UserRole.PRESIDENT,
         is_active=True,
         must_change_password=True,
+        created_at=now,
+        updated_at=now,
     )
     db.add(president)
     await db.commit()
@@ -292,6 +426,7 @@ async def reset_president_password(
     temp_pwd = generate_temporary_password()
     president.hashed_password = get_password_hash(temp_pwd)
     president.must_change_password = True
+    president.updated_at = datetime.utcnow().replace(tzinfo=None)
 
     await db.commit()
 
@@ -338,6 +473,7 @@ async def update_president_details(
     if payload.phone_number is not None:
         president.phone_number = payload.phone_number
 
+    president.updated_at = datetime.utcnow().replace(tzinfo=None)
     await db.commit()
     await db.refresh(president)
 
@@ -357,6 +493,7 @@ async def update_club_features(
 
     club.features = features_in.model_dump()
     flag_modified(club, "features")
+    club.updated_at = datetime.utcnow().replace(tzinfo=None)
     await db.commit()
     await db.refresh(club)
 
@@ -402,6 +539,7 @@ async def update_club_status(
     if club_update.is_active is not None:
         club.is_active = club_update.is_active
 
+    club.updated_at = datetime.utcnow().replace(tzinfo=None)
     await db.commit()
     await db.refresh(club)
 
