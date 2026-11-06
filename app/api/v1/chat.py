@@ -514,10 +514,21 @@ async def global_realtime_sync_endpoint(
 
     async with AsyncSessionLocal() as db:
         user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-        if not user or not user.tenant_id:
+        if not user:
             await websocket.close(code=1008)
             return
-        tenant_id_str = str(user.tenant_id)
+
+        # Assign Virtual Channels for Platform Owners and Regional Governors
+        if user.tenant_id:
+            tenant_id_str = str(user.tenant_id).lower()
+        elif user.role == UserRole.SUPER_ADMIN:
+            tenant_id_str = "platform_admin_channel"
+        elif user.role == UserRole.DISTRICT_GOVERNOR:
+            safe_district = str(user.district).replace(" ", "_").lower() if user.district else "unknown"
+            tenant_id_str = f"district_{safe_district}"
+        else:
+            await websocket.close(code=1008)
+            return
 
     await manager.connect_tenant(tenant_id_str, websocket)
 

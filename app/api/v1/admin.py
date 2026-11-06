@@ -11,6 +11,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.security import get_password_hash, generate_temporary_password
+from app.core.ws_manager import manager
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.schemas.tenant import (
@@ -36,6 +37,24 @@ async def verify_super_admin(current_user: User = Depends(get_current_user)) -> 
         )
     return current_user
 
+async def verify_admin_or_governor(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role not in [UserRole.SUPER_ADMIN, UserRole.DISTRICT_GOVERNOR]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super Admin or District Governor privileges are required",
+        )
+    return current_user
+
+
+async def notify_platform(district: Optional[str] = None):
+    try:
+        await manager.broadcast_to_tenant("platform_admin_channel", {"type": "PLATFORM_UPDATE"})
+        if district:
+            safe_district = str(district).replace(" ", "_").lower()
+            await manager.broadcast_to_tenant(f"district_{safe_district}", {"type": "PLATFORM_UPDATE"})
+    except Exception:
+        pass
+
 
 class GovernorCreateRequest(BaseModel):
     full_name: str
@@ -43,6 +62,11 @@ class GovernorCreateRequest(BaseModel):
     phone_number: Optional[str] = None
     district: str
 
+class GovernorUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone_number: Optional[str] = None
+    district: Optional[str] = None
 
 class GovernorResponse(BaseModel):
     id: uuid.UUID
@@ -64,7 +88,6 @@ async def get_platform_telemetry(
         await db.execute(select(func.count(Tenant.id)).where(Tenant.is_active == True))
     ).scalar_one() or 0
 
-    # Exclude Super Admin and Governors from platform club member count
     total_members = (
         await db.execute(
             select(func.count(User.id)).where(
@@ -153,6 +176,7 @@ async def create_district_governor(
     )
     db.add(governor)
     await db.commit()
+    await notify_platform(governor.district)
 
     return AssignPresidentResponse(
         message=f"District Governor appointed successfully for {payload.district}",
@@ -162,6 +186,45 @@ async def create_district_governor(
             email=governor.email,
             temp_password=temp_pwd,
         ),
+    )
+
+
+@router.patch("/governors/{governor_id}", response_model=GovernorResponse)
+async def update_district_governor(
+    governor_id: uuid.UUID,
+    payload: GovernorUpdateRequest,
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    gov = (await db.execute(select(User).where(User.id == governor_id, User.role == UserRole.DISTRICT_GOVERNOR))).scalar_one_or_none()
+    if not gov:
+        raise HTTPException(status_code=404, detail="Governor not found")
+
+    if payload.email and payload.email != gov.email:
+        existing = (await db.execute(select(User).where(User.email == payload.email, User.id != governor_id))).scalar_one_or_none()
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already in use")
+        gov.email = payload.email
+
+    if payload.full_name:
+        gov.full_name = payload.full_name
+    if payload.phone_number is not None:
+        gov.phone_number = payload.phone_number
+    if payload.district:
+        gov.district = payload.district
+
+    gov.updated_at = datetime.utcnow().replace(tzinfo=None)
+    await db.commit()
+    await notify_platform(gov.district)
+
+    return GovernorResponse(
+        id=gov.id,
+        full_name=gov.full_name,
+        email=gov.email,
+        phone_number=gov.phone_number,
+        district=gov.district or "Unassigned District",
+        is_active=gov.is_active,
+        created_at=gov.created_at,
     )
 
 
@@ -279,16 +342,6 @@ async def create_new_club(
             detail=f"Club workspace with identifier '{club_in.slug}' already exists",
         )
 
-    if club_in.president_email:
-        existing_user = (
-            await db.execute(select(User).where(User.email == club_in.president_email))
-        ).scalar_one_or_none()
-        if existing_user:
-            raise HTTPException(
-                status_code=400,
-                detail=f"A user with email '{club_in.president_email}' is already registered",
-            )
-
     now = datetime.utcnow().replace(tzinfo=None)
     new_club = Tenant(
         name=club_in.name,
@@ -312,43 +365,10 @@ async def create_new_club(
         updated_at=now,
     )
     db.add(new_club)
-    await db.flush()
-
-    credentials_data = None
-    pres_info = None
-
-    if club_in.president_email and club_in.president_name:
-        temp_pwd = generate_temporary_password()
-        president = User(
-            id=uuid.uuid4(),
-            tenant_id=new_club.id,
-            full_name=club_in.president_name,
-            email=club_in.president_email,
-            phone_number=club_in.president_phone,
-            hashed_password=get_password_hash(temp_pwd),
-            role=UserRole.PRESIDENT,
-            is_active=True,
-            must_change_password=True,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(president)
-        credentials_data = CredentialsInfo(
-            club_name=new_club.name,
-            president_name=president.full_name,
-            email=president.email,
-            temp_password=temp_pwd,
-        )
-        pres_info = ClubPresidentInfo(
-            id=president.id,
-            full_name=president.full_name,
-            email=president.email,
-            phone_number=president.phone_number,
-            is_active=president.is_active,
-        )
-
     await db.commit()
     await db.refresh(new_club)
+
+    await notify_platform(new_club.district)
 
     return ClubResponse(
         id=new_club.id,
@@ -359,9 +379,9 @@ async def create_new_club(
         features=new_club.features or {},
         theme_config=new_club.theme_config or {},
         created_at=new_club.created_at,
-        member_count=1 if credentials_data else 0,
-        president=pres_info,
-        credentials=credentials_data,
+        member_count=0,
+        president=None,
+        credentials=None,
     )
 
 
@@ -369,12 +389,16 @@ async def create_new_club(
 async def assign_initial_president(
     club_id: uuid.UUID,
     payload: AssignPresidentRequest,
-    _: User = Depends(verify_super_admin),
+    current_user: User = Depends(verify_admin_or_governor),
     db: AsyncSession = Depends(get_db),
 ):
     club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
+
+    # Security: Ensure Governor only assigns president to clubs in their own district
+    if current_user.role == UserRole.DISTRICT_GOVERNOR and club.district != current_user.district:
+        raise HTTPException(status_code=403, detail="Governors can only assign presidents within their own district")
 
     existing_user = (
         await db.execute(select(User).where(User.email == payload.email))
@@ -395,6 +419,7 @@ async def assign_initial_president(
         phone_number=payload.phone_number,
         hashed_password=get_password_hash(temp_pwd),
         role=UserRole.PRESIDENT,
+        district=club.district,
         is_active=True,
         must_change_password=True,
         created_at=now,
@@ -402,6 +427,7 @@ async def assign_initial_president(
     )
     db.add(president)
     await db.commit()
+    await notify_platform(club.district)
 
     return AssignPresidentResponse(
         message="Club President provisioned successfully",
@@ -489,6 +515,7 @@ async def update_president_details(
     president.updated_at = datetime.utcnow().replace(tzinfo=None)
     await db.commit()
     await db.refresh(president)
+    await notify_platform()
 
     return ClubPresidentInfo.model_validate(president)
 
@@ -509,6 +536,7 @@ async def update_club_features(
     club.updated_at = datetime.utcnow().replace(tzinfo=None)
     await db.commit()
     await db.refresh(club)
+    await notify_platform(club.district)
 
     count = (
         await db.execute(select(func.count(User.id)).where(User.tenant_id == club_id))
@@ -555,6 +583,7 @@ async def update_club_status(
     club.updated_at = datetime.utcnow().replace(tzinfo=None)
     await db.commit()
     await db.refresh(club)
+    await notify_platform(club.district)
 
     count = (
         await db.execute(select(func.count(User.id)).where(User.tenant_id == club_id))
@@ -590,7 +619,9 @@ async def delete_club_workspace(
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
 
+    dist = club.district
     await db.delete(club)
     await db.commit()
+    await notify_platform(dist)
 
     return {"status": "success", "message": f"Club workspace '{club.name}' successfully deleted"}
