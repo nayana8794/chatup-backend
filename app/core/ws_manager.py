@@ -12,7 +12,6 @@ class ConnectionManager:
         # Real-time Document Locks: { minute_id: dict }
         self.mom_locks: Dict[str, dict] = {}
 
-    # Room connections
     async def connect_room(self, room_id: str, websocket: WebSocket):
         await websocket.accept()
         r_key = str(room_id).lower()
@@ -36,7 +35,6 @@ class ConnectionManager:
                 except Exception:
                     self.disconnect_room(r_key, connection)
 
-    # Tenant-level global connections
     async def connect_tenant(self, tenant_id: str, websocket: WebSocket):
         await websocket.accept()
         t_key = str(tenant_id).lower()
@@ -53,7 +51,6 @@ class ConnectionManager:
 
     async def broadcast_to_tenant(self, tenant_id: str, event_data: dict):
         t_key = str(tenant_id).lower()
-        # Case-insensitive robust matching
         for active_t, conns in list(self.active_tenants.items()):
             if active_t.lower() == t_key:
                 for connection in list(conns):
@@ -62,7 +59,15 @@ class ConnectionManager:
                     except Exception:
                         self.disconnect_tenant(active_t, connection)
 
-    # Real-time MOM Document Lock Engine
+    async def broadcast_global(self, event_data: dict):
+        """Broadcasts live platform update events to ALL active connections across all tenants."""
+        for active_t, conns in list(self.active_tenants.items()):
+            for connection in list(conns):
+                try:
+                    await connection.send_json(event_data)
+                except Exception:
+                    self.disconnect_tenant(active_t, connection)
+
     def acquire_mom_lock(
         self, minute_id: str, user_id: str, user_name: str, user_role: str, force: bool = False
     ) -> tuple[bool, Optional[dict]]:

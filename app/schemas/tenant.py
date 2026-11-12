@@ -1,5 +1,6 @@
+# chatup/backend/app/schemas/tenant.py
 import uuid
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, EmailStr
 from datetime import datetime
 
@@ -21,6 +22,28 @@ class ClubPresidentInfo(BaseModel):
     full_name: str
     email: str
     phone_number: Optional[str] = None
+    is_active: bool = True
+
+    class Config:
+        from_attributes = True
+
+class ClubGovernorInfo(BaseModel):
+    id: uuid.UUID
+    full_name: str
+    email: str
+    phone_number: Optional[str] = None
+    district: str
+    is_active: bool = True
+
+    class Config:
+        from_attributes = True
+
+class ClubOfficeBearerInfo(BaseModel):
+    id: uuid.UUID
+    full_name: str
+    email: str
+    phone_number: Optional[str] = None
+    role: str
     is_active: bool = True
 
     class Config:
@@ -56,7 +79,22 @@ class ClubResponse(BaseModel):
     created_at: datetime
     member_count: int = 0
     president: Optional[ClubPresidentInfo] = None
+    governor: Optional[ClubGovernorInfo] = None
     credentials: Optional[CredentialsInfo] = None
+
+    class Config:
+        from_attributes = True
+
+class DistrictClubRosterResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    slug: str
+    district: Optional[str] = None
+    is_active: bool
+    member_count: int = 0
+    president: Optional[ClubPresidentInfo] = None
+    office_bearers: List[ClubOfficeBearerInfo] = []
+    features: Dict[str, Any] = {}
 
     class Config:
         from_attributes = True
