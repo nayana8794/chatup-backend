@@ -31,6 +31,7 @@ active_call_sessions: Dict[str, dict] = {}
 
 CALL_HOST_ROLES = [
     "SUPER_ADMIN",
+    "DISTRICT_GOVERNOR",
     "PRESIDENT",
     "VICE_PRESIDENT",
     "SECRETARY",
@@ -55,29 +56,66 @@ class EndCallRequest(BaseModel):
     room_id: str
 
 
-@router.get("/active")
+class ActiveCallStatusResponse(BaseModel):
+    is_active: bool
+    room_id: Optional[str] = None
+    caller_name: Optional[str] = None
+    participant_count: int = 0
+    call_type: str = "video"
+
+
+@router.get("/active", response_model=ActiveCallStatusResponse)
+@router.get("/active-meeting", response_model=ActiveCallStatusResponse)
 async def get_active_club_call(
     current_user: User = Depends(get_current_user),
 ):
+    """Checks whether an active virtual conference or group call is ongoing in the user's club."""
     if not current_user.tenant_id:
-        return {"active": False, "room_id": None, "participant_count": 0, "call_type": "video"}
+        return ActiveCallStatusResponse(is_active=False)
 
-    room_id = f"club-meeting-{str(current_user.tenant_id).lower()}"
-    participants = call_rooms.get(room_id, {})
-    count = len(participants)
+    tenant_id_str = str(current_user.tenant_id).lower()
+    default_room_id = f"club-meeting-{tenant_id_str}"
 
-    meta = call_room_meta.get(room_id, {})
-    call_type = meta.get("call_type", "video")
+    active_room = None
+    participant_count = 0
+    caller_name = None
+    call_type = "video"
 
-    return {
-        "active": count > 0,
-        "room_id": room_id,
-        "participant_count": count,
-        "call_type": call_type,
-    }
+    # 1. Inspect live WebSockets in default club room or any tenant call room
+    for r_key, conns in call_rooms.items():
+        if tenant_id_str in r_key and len(conns) > 0:
+            active_room = r_key
+            participant_count = len(conns)
+            meta = call_room_meta.get(r_key, {})
+            call_type = meta.get("call_type", "video")
+
+            # Extract host or first peer name
+            for p in conns.values():
+                if p.get("is_host"):
+                    caller_name = p.get("user_name")
+                    break
+            if not caller_name and conns:
+                caller_name = list(conns.values())[0].get("user_name")
+            break
+
+    # 2. Check ringing/initiated session window if peers haven't connected yet
+    if not active_room and default_room_id in active_call_sessions:
+        sess = active_call_sessions[default_room_id]
+        created_at = sess.get("created_at")
+        if created_at and (datetime.utcnow().replace(tzinfo=None) - created_at).total_seconds() < 120:
+            active_room = default_room_id
+            caller_name = sess.get("caller_name")
+            call_type = sess.get("call_type", "video")
+
+    return ActiveCallStatusResponse(
+        is_active=bool(active_room),
+        room_id=active_room,
+        caller_name=caller_name,
+        participant_count=participant_count,
+        call_type=call_type,
+    )
 
 
-# FIX A: Active Call Status Verification Endpoint for Mobile Clients
 @router.get("/room-status")
 async def get_room_call_status(
     room_id: str,
@@ -86,11 +124,9 @@ async def get_room_call_status(
     r_key = str(room_id).lower()
     is_active = False
 
-    # A room is only truly active if it has active WebSockets connected or active host session
     if r_key in call_rooms and len(call_rooms[r_key]) > 0:
         is_active = True
     elif r_key in active_call_sessions:
-        # Check if call was created within last 60 seconds (ringing window)
         created_at = active_call_sessions[r_key].get("created_at")
         if created_at and (datetime.utcnow().replace(tzinfo=None) - created_at).total_seconds() < 60:
             is_active = True
@@ -113,7 +149,8 @@ async def initiate_call(
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User does not belong to a club")
 
-    if not req.target_user_id and current_user.role.value not in CALL_HOST_ROLES:
+    role_val = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    if not req.target_user_id and role_val not in CALL_HOST_ROLES:
         raise HTTPException(
             status_code=403,
             detail="Only President or Club Officers can initiate club conference meetings",
@@ -155,7 +192,7 @@ async def initiate_call(
         "room_id": req.room_id,
         "caller_id": str(current_user.id),
         "caller_name": current_user.full_name,
-        "caller_role": current_user.role.value,
+        "caller_role": role_val,
         "call_type": clean_call_type,
         "is_direct": bool(req.target_user_id),
         "target_user_id": str(req.target_user_id) if req.target_user_id else None,
@@ -256,7 +293,6 @@ async def end_call(
         call_rooms[r_key].clear()
         del call_rooms[r_key]
 
-    # Handle Missed Calls
     session = active_call_sessions.pop(r_key, None)
     if session and session.get("target_user_id"):
         target_uid = session["target_user_id"]
@@ -314,14 +350,16 @@ async def webrtc_signaling_endpoint(
             await websocket.close(code=1008)
             return
         user_name = user.full_name
-        user_role = user.role.value
+        user_role = user.role.value if hasattr(user.role, "value") else str(user.role)
         tenant_id_str = str(user.tenant_id).lower() if user.tenant_id else None
 
     await websocket.accept()
 
     r_key = str(room_id).lower()
+    first_peer = False
     if r_key not in call_rooms:
         call_rooms[r_key] = {}
+        first_peer = True
 
     if r_key in active_call_sessions:
         active_call_sessions[r_key]["answered_user_ids"].add(str(user_id).lower())
@@ -329,6 +367,21 @@ async def webrtc_signaling_endpoint(
     is_host = user_role in CALL_HOST_ROLES
     meta = call_room_meta.get(r_key, {})
     room_call_type = meta.get("call_type", "video")
+
+    # Notify tenant that meeting is live when first peer enters
+    if first_peer and tenant_id_str:
+        try:
+            await manager.broadcast_to_tenant(
+                tenant_id_str,
+                {
+                    "type": "CALL_STARTED",
+                    "room_id": room_id,
+                    "caller_name": user_name,
+                    "call_type": room_call_type,
+                },
+            )
+        except Exception:
+            pass
 
     try:
         await websocket.send_json({
@@ -466,6 +519,16 @@ async def webrtc_signaling_endpoint(
                 await manager.broadcast_to_tenant(
                     tenant_id_str,
                     {"type": "CALL_ENDED", "room_id": room_id, "ended_by_id": str(user_id)},
+                )
+            except Exception:
+                pass
+
+        # Broadcast live call ended if room is completely empty
+        if r_key not in call_rooms and tenant_id_str:
+            try:
+                await manager.broadcast_to_tenant(
+                    tenant_id_str,
+                    {"type": "CALL_ENDED", "room_id": room_id},
                 )
             except Exception:
                 pass
