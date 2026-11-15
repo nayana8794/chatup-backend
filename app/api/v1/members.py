@@ -8,9 +8,12 @@ import logging
 from typing import List, Optional
 from datetime import datetime
 from pydantic import BaseModel, EmailStr
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
+from sqlalchemy.orm.attributes import flag_modified
+import cloudinary
+import cloudinary.uploader
 
 from app.core.database import get_db
 from app.core.deps import get_current_president, get_current_user
@@ -37,6 +40,11 @@ class MemberRoleUpdateRequest(BaseModel):
     language: Optional[LanguagePreference] = None
 
 
+class MyClubBrandingUpdate(BaseModel):
+    primary_color: Optional[str] = None
+    secondary_color: Optional[str] = None
+
+
 class DigitalMembershipCardResponse(BaseModel):
     member_id: str
     full_name: str
@@ -46,7 +54,7 @@ class DigitalMembershipCardResponse(BaseModel):
     club_name: str
     club_slug: str
     district: str
-    joined_date: str  # String ISO format for 100% Pydantic safety
+    joined_date: str
     dues_standing: str
     qr_payload: str
     card_serial: str
@@ -70,7 +78,6 @@ def generate_friendly_temp_password() -> str:
 
 
 def generate_qr_signature(user_id: str, tenant_id: str) -> str:
-    """Generates a tamper-proof HMAC-SHA256 signature for physical/digital QR verification."""
     secret = getattr(settings, "SECRET_KEY", "chatup_default_secret_key_2026")
     if not isinstance(secret, (str, bytes)):
         secret = str(secret)
@@ -250,7 +257,76 @@ async def delete_member(
     return {"message": "Member removed successfully"}
 
 
-# ================= 100% BULLETPROOF DIGITAL MEMBERSHIP CARD =================
+# ================= PRESIDENT CLUB BRANDING & CREST LOGO MANAGEMENT =================
+@router.patch("/my-club/branding")
+async def update_my_club_branding(
+    payload: MyClubBrandingUpdate,
+    president: User = Depends(get_current_president),
+    db: AsyncSession = Depends(get_db),
+):
+    """Allows Club President to customize their local workspace brand colors."""
+    if not president.tenant_id:
+        raise HTTPException(status_code=400, detail="No club workspace assigned")
+
+    club = (await db.execute(select(Tenant).where(Tenant.id == president.tenant_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club workspace not found")
+
+    current_config = club.theme_config or {}
+    if payload.primary_color:
+        current_config["primary_color"] = payload.primary_color
+    if payload.secondary_color:
+        current_config["secondary_color"] = payload.secondary_color
+
+    club.theme_config = current_config
+    flag_modified(club, "theme_config")
+    club.updated_at = datetime.utcnow().replace(tzinfo=None)
+
+    await db.commit()
+    return {"status": "success", "theme_config": club.theme_config}
+
+
+@router.post("/my-club/upload-crest")
+async def upload_my_club_crest(
+    file: UploadFile = File(...),
+    president: User = Depends(get_current_president),
+    db: AsyncSession = Depends(get_db),
+):
+    """Allows Club President to upload their official club crest/logo to Cloudinary CDN."""
+    if not president.tenant_id:
+        raise HTTPException(status_code=400, detail="No club workspace assigned")
+
+    club = (await db.execute(select(Tenant).where(Tenant.id == president.tenant_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club workspace not found")
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are accepted")
+
+    try:
+        content = await file.read()
+        upload_result = cloudinary.uploader.upload(
+            content,
+            folder="chatup_branding",
+            public_id=f"crest_{club.slug}",
+            overwrite=True,
+            resource_type="image",
+        )
+        logo_url = upload_result.get("secure_url")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {str(e)}")
+
+    current_config = club.theme_config or {}
+    current_config["logo_url"] = logo_url
+    club.theme_config = current_config
+    flag_modified(club, "theme_config")
+    club.updated_at = datetime.utcnow().replace(tzinfo=None)
+
+    await db.commit()
+    return {"status": "success", "logo_url": logo_url, "theme_config": club.theme_config}
+
+
+# ================= DIGITAL MEMBERSHIP CARD & QR VERIFICATION =================
 @router.get("/me/digital-card")
 async def get_my_digital_membership_card(
     current_user: User = Depends(get_current_user),
@@ -258,7 +334,6 @@ async def get_my_digital_membership_card(
 ):
     """Retrieves digital wallet membership card with 100% crash-proof fallbacks."""
     try:
-        # 1. Resolve club workspace safely
         tenant_id = current_user.tenant_id
         club = None
         if tenant_id:
@@ -277,7 +352,6 @@ async def get_my_digital_membership_card(
         )
         club_id_str = str(club.id) if club else str(uuid.uuid4())
 
-        # 2. Dues standing (safe fallback)
         dues_standing = "PAID"
         try:
             inv_res = await db.execute(
@@ -294,7 +368,6 @@ async def get_my_digital_membership_card(
         except Exception:
             dues_standing = "PAID"
 
-        # 3. Signature & serial
         sig = generate_qr_signature(str(current_user.id), club_id_str)
         card_serial = f"LIONS-{str(current_user.id)[:8].upper()}"
         verification_url = f"https://chatup-frontend-steel.vercel.app/verify-member?uid={current_user.id}&tid={club_id_str}&sig={sig}"

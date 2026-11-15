@@ -4,10 +4,20 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel, EmailStr
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+    Query,
+    UploadFile,
+    File,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_
 from sqlalchemy.orm.attributes import flag_modified
+import cloudinary
+import cloudinary.uploader
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
@@ -102,6 +112,12 @@ class GovernorResponse(BaseModel):
     clubs: List[GovernorClubBrief] = []
 
 
+class ClubBrandingUpdate(BaseModel):
+    primary_color: Optional[str] = "#002F6C"
+    secondary_color: Optional[str] = "#F2A900"
+    logo_url: Optional[str] = None
+
+
 @router.get("/stats")
 async def get_platform_telemetry(
     _: User = Depends(verify_super_admin),
@@ -157,14 +173,12 @@ async def list_district_governors(
     result = await db.execute(query)
     governors = result.scalars().all()
 
-    # Pre-fetch all tenants and presidents for hierarchy mapping
     all_clubs = (await db.execute(select(Tenant))).scalars().all()
     all_presidents = (
         await db.execute(select(User).where(User.role == UserRole.PRESIDENT))
     ).scalars().all()
     presidents_map = {p.tenant_id: p for p in all_presidents}
 
-    # Member counts map
     counts_res = await db.execute(
         select(User.tenant_id, func.count(User.id)).group_by(User.tenant_id)
     )
@@ -368,12 +382,10 @@ async def list_all_clubs(
 
     result = await db.execute(query)
 
-    # Fetch presidents
     presidents_res = await db.execute(select(User).where(User.role == UserRole.PRESIDENT))
     presidents = presidents_res.scalars().all()
     presidents_map = {p.tenant_id: p for p in presidents}
 
-    # Fetch governors to associate with each club's district
     governors_res = await db.execute(
         select(User).where(User.role == UserRole.DISTRICT_GOVERNOR)
     )
@@ -392,7 +404,6 @@ async def list_all_clubs(
                 is_active=pres.is_active,
             )
 
-        # Match governor by district code
         tenant_dist_code = extract_district_code(tenant.district)
         gov_info = None
         for g in governors:
@@ -672,6 +683,100 @@ async def update_club_features(
         president=ClubPresidentInfo.model_validate(pres) if pres else None,
         governor=None,
     )
+
+
+# ================= CLUB BRANDING & CREST LOGO MANAGEMENT (SUPER ADMIN & GOVERNOR) =================
+@router.patch("/clubs/{club_id}/branding")
+async def update_club_branding(
+    club_id: uuid.UUID,
+    payload: ClubBrandingUpdate,
+    current_user: User = Depends(verify_admin_or_governor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Updates custom theme colors and branding parameters for a club workspace."""
+    club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club workspace not found")
+
+    if current_user.role == UserRole.DISTRICT_GOVERNOR:
+        dist_code = extract_district_code(current_user.district)
+        club_dist_code = extract_district_code(club.district)
+        if dist_code != club_dist_code:
+            raise HTTPException(status_code=403, detail="Governors can only update branding for clubs in their own district")
+
+    current_config = club.theme_config or {}
+    if payload.primary_color:
+        current_config["primary_color"] = payload.primary_color
+    if payload.secondary_color:
+        current_config["secondary_color"] = payload.secondary_color
+    if payload.logo_url is not None:
+        current_config["logo_url"] = payload.logo_url
+
+    club.theme_config = current_config
+    flag_modified(club, "theme_config")
+    club.updated_at = datetime.utcnow().replace(tzinfo=None)
+
+    await db.commit()
+    await db.refresh(club)
+    await notify_platform()
+
+    return {
+        "status": "success",
+        "club_id": club.id,
+        "theme_config": club.theme_config,
+    }
+
+
+@router.post("/clubs/{club_id}/upload-crest")
+async def upload_club_crest(
+    club_id: uuid.UUID,
+    file: UploadFile = File(...),
+    current_user: User = Depends(verify_admin_or_governor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Uploads the club's official crest/logo to Cloudinary CDN and updates theme config."""
+    club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club workspace not found")
+
+    if current_user.role == UserRole.DISTRICT_GOVERNOR:
+        dist_code = extract_district_code(current_user.district)
+        club_dist_code = extract_district_code(club.district)
+        if dist_code != club_dist_code:
+            raise HTTPException(status_code=403, detail="Governors can only upload crests for clubs in their own district")
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files (PNG, JPG, SVG) are permitted")
+
+    try:
+        content = await file.read()
+        upload_result = cloudinary.uploader.upload(
+            content,
+            folder="chatup_branding",
+            public_id=f"crest_{club.slug}",
+            overwrite=True,
+            resource_type="image",
+        )
+        logo_url = upload_result.get("secure_url")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {str(e)}")
+
+    current_config = club.theme_config or {}
+    current_config["logo_url"] = logo_url
+
+    club.theme_config = current_config
+    flag_modified(club, "theme_config")
+    club.updated_at = datetime.utcnow().replace(tzinfo=None)
+
+    await db.commit()
+    await db.refresh(club)
+    await notify_platform()
+
+    return {
+        "status": "success",
+        "logo_url": logo_url,
+        "theme_config": club.theme_config,
+    }
 
 
 @router.patch("/clubs/{club_id}", response_model=ClubResponse)
