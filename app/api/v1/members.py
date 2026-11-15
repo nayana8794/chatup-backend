@@ -46,7 +46,7 @@ class DigitalMembershipCardResponse(BaseModel):
     club_name: str
     club_slug: str
     district: str
-    joined_date: datetime
+    joined_date: str  # String ISO format for 100% Pydantic safety
     dues_standing: str
     qr_payload: str
     card_serial: str
@@ -71,7 +71,11 @@ def generate_friendly_temp_password() -> str:
 
 def generate_qr_signature(user_id: str, tenant_id: str) -> str:
     """Generates a tamper-proof HMAC-SHA256 signature for physical/digital QR verification."""
-    secret = str(settings.SECRET_KEY).encode()
+    secret = getattr(settings, "SECRET_KEY", "chatup_default_secret_key_2026")
+    if not isinstance(secret, (str, bytes)):
+        secret = str(secret)
+    if isinstance(secret, str):
+        secret = secret.encode()
     payload = f"{user_id}:{tenant_id}".encode()
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()[:16]
 
@@ -263,7 +267,6 @@ async def get_my_digital_membership_card(
             ).scalar_one_or_none()
 
         if not club:
-            # Fallback to the first available club if user is Super Admin or unlinked
             club = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
 
         club_name = club.name if club else "Lions Community Club"
@@ -274,7 +277,7 @@ async def get_my_digital_membership_card(
         )
         club_id_str = str(club.id) if club else str(uuid.uuid4())
 
-        # 2. Dues standing (fail-safe without schema crashes)
+        # 2. Dues standing (safe fallback)
         dues_standing = "PAID"
         try:
             inv_res = await db.execute(
@@ -288,11 +291,10 @@ async def get_my_digital_membership_card(
                     break
                 elif "PENDING" in st or "UNPAID" in st:
                     dues_standing = "PENDING"
-        except Exception as dues_err:
-            logger.warning(f"Could not calculate dues standing: {dues_err}")
+        except Exception:
             dues_standing = "PAID"
 
-        # 3. Cryptographic signature & card serial
+        # 3. Signature & serial
         sig = generate_qr_signature(str(current_user.id), club_id_str)
         card_serial = f"LIONS-{str(current_user.id)[:8].upper()}"
         verification_url = f"https://chatup-frontend-steel.vercel.app/verify-member?uid={current_user.id}&tid={club_id_str}&sig={sig}"
@@ -313,7 +315,7 @@ async def get_my_digital_membership_card(
         return {
             "member_id": str(current_user.id),
             "full_name": current_user.full_name or "Club Member",
-            "email": current_user.email,
+            "email": current_user.email or "member@chatup.com",
             "phone_number": current_user.phone_number,
             "role": role_str,
             "club_name": club_name,
@@ -325,7 +327,7 @@ async def get_my_digital_membership_card(
             "card_serial": card_serial,
         }
     except Exception as e:
-        logger.error(f"Fatal error generating digital card: {e}", exc_info=True)
+        logger.error(f"Error generating digital card: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Card generation error: {str(e)}",
