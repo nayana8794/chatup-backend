@@ -10,15 +10,16 @@ from datetime import datetime
 from pydantic import BaseModel, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 import cloudinary
 import cloudinary.uploader
-from app.core.ws_manager import manager
+
 from app.core.database import get_db
 from app.core.deps import get_current_president, get_current_user
 from app.core.security import get_password_hash
 from app.core.config import settings
+from app.core.ws_manager import manager
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole, LanguagePreference
 from app.models.financial import DuesInvoice
@@ -257,7 +258,25 @@ async def delete_member(
     return {"message": "Member removed successfully"}
 
 
-# ================= PRESIDENT CLUB BRANDING & CREST LOGO MANAGEMENT =================
+# ================= PRESIDENT & MEMBER CLUB BRANDING SYNC =================
+@router.get("/my-club/branding")
+async def get_my_club_branding(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns active branding configuration (colors & logo URL) for the authenticated member's club."""
+    if not current_user.tenant_id:
+        return {"theme_config": {}}
+
+    club = (
+        await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
+    ).scalar_one_or_none()
+    if not club:
+        return {"theme_config": {}}
+
+    return {"theme_config": club.theme_config or {}}
+
+
 @router.patch("/my-club/branding")
 async def update_my_club_branding(
     payload: MyClubBrandingUpdate,
@@ -283,6 +302,10 @@ async def update_my_club_branding(
     club.updated_at = datetime.utcnow().replace(tzinfo=None)
 
     await db.commit()
+    try:
+        await manager.broadcast_global({"type": "PLATFORM_UPDATE"})
+    except Exception:
+        pass
     return {"status": "success", "theme_config": club.theme_config}
 
 
@@ -323,6 +346,10 @@ async def upload_my_club_crest(
     club.updated_at = datetime.utcnow().replace(tzinfo=None)
 
     await db.commit()
+    try:
+        await manager.broadcast_global({"type": "PLATFORM_UPDATE"})
+    except Exception:
+        pass
     return {"status": "success", "logo_url": logo_url, "theme_config": club.theme_config}
 
 
@@ -464,20 +491,3 @@ async def verify_member_credentials(
         dues_standing=dues_standing,
         verified_at=now_utc,
     )
-
-    @router.get("/my-club/branding")
-    async def get_my_club_branding(
-        current_user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
-    ):
-        """Returns active branding configuration (colors & logo URL) for the authenticated member's club."""
-        if not current_user.tenant_id:
-            return {"theme_config": {}}
-
-        club = (
-            await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
-        ).scalar_one_or_none()
-        if not club:
-            return {"theme_config": {}}
-
-        return {"theme_config": club.theme_config or {}}
