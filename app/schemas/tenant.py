@@ -107,3 +107,19 @@ class AssignPresidentRequest(BaseModel):
 class AssignPresidentResponse(BaseModel):
     message: str
     credentials: CredentialsInfo
+
+
+class DistrictClubRosterResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    slug: str
+    district: Optional[str] = None
+    is_active: bool
+    member_count: int = 0
+    president: Optional[ClubPresidentInfo] = None
+    office_bearers: List[ClubOfficeBearerInfo] = []
+    features: Dict[str, Any] = {}
+    theme_config: Dict[str, Any] = {}
+
+    class Config:
+        from_attributes = True

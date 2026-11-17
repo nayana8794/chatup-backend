@@ -14,7 +14,7 @@ from sqlalchemy import select, and_
 from sqlalchemy.orm.attributes import flag_modified
 import cloudinary
 import cloudinary.uploader
-
+from app.core.ws_manager import manager
 from app.core.database import get_db
 from app.core.deps import get_current_president, get_current_user
 from app.core.security import get_password_hash
@@ -464,3 +464,20 @@ async def verify_member_credentials(
         dues_standing=dues_standing,
         verified_at=now_utc,
     )
+
+    @router.get("/my-club/branding")
+    async def get_my_club_branding(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ):
+        """Returns active branding configuration (colors & logo URL) for the authenticated member's club."""
+        if not current_user.tenant_id:
+            return {"theme_config": {}}
+
+        club = (
+            await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
+        ).scalar_one_or_none()
+        if not club:
+            return {"theme_config": {}}
+
+        return {"theme_config": club.theme_config or {}}

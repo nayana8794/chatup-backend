@@ -202,6 +202,8 @@ async def list_district_clubs(
                 president=pres_info,
                 office_bearers=office_bearers_map.get(c.id, []),
                 features=c.features or {},
+                theme_config=c.theme_config or {},
+
             )
         )
 
