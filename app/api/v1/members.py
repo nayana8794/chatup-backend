@@ -10,7 +10,7 @@ from datetime import datetime
 from pydantic import BaseModel, EmailStr
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm.attributes import flag_modified
 import cloudinary
 import cloudinary.uploader
@@ -86,6 +86,16 @@ def generate_qr_signature(user_id: str, tenant_id: str) -> str:
         secret = secret.encode()
     payload = f"{user_id}:{tenant_id}".encode()
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()[:16]
+
+
+def generate_finnish_viitenumero(seed_str: str) -> str:
+    """Generates a valid Finnish banking reference number (Viitenumero) using 7-3-1 weights."""
+    digits_only = "".join(str(ord(c) % 10) for c in seed_str[:8])
+    base_digits = str(int(digits_only) + 100000)
+    weights = [7, 3, 1]
+    total = sum(int(ch) * weights[idx % 3] for idx, ch in enumerate(reversed(base_digits)))
+    check_digit = (10 - (total % 10)) % 10
+    return f"{base_digits}{check_digit}"
 
 
 @router.post("", response_model=MemberCreatedWithTempPass)
@@ -256,6 +266,62 @@ async def delete_member(
     await db.delete(member)
     await db.commit()
     return {"message": "Member removed successfully"}
+
+
+# ================= CLUB SAAS SUBSCRIPTION & SEPA INVOICING =================
+@router.get("/my-club/subscription")
+async def get_my_club_subscription(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns active subscription tier, calculated seat/flat price, and SEPA payment reference for the club."""
+    if not current_user.tenant_id:
+        return {"has_club": False}
+
+    club = (await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))).scalar_one_or_none()
+    if not club:
+        return {"has_club": False}
+
+    member_count = (
+        await db.execute(select(func.count(User.id)).where(User.tenant_id == club.id))
+    ).scalar_one() or 0
+
+    feat = club.features or {}
+    plan = feat.get("plan_type", "CLUB_EXECUTIVE")
+    cycle = feat.get("billing_cycle", "YEARLY")
+    sub_status = feat.get("subscription_status", "TRIAL")
+    max_members = feat.get("max_members", 50)
+    custom_price = feat.get("custom_price_eur")
+
+    seats = max(5, member_count)
+    if custom_price is not None:
+        calculated_price = float(custom_price)
+    elif plan == "FLEX_PER_PERSON":
+        calculated_price = round(seats * (19.0 if cycle == "YEARLY" else 1.90), 2)
+    elif plan == "ASSOCIATION_PRO":
+        calculated_price = 790.0 if cycle == "YEARLY" else 79.0
+    elif plan == "DISTRICT_BUNDLE":
+        calculated_price = 320.0
+    else:
+        calculated_price = 490.0 if cycle == "YEARLY" else 49.0
+
+    viitenumero = generate_finnish_viitenumero(str(club.id).replace("-", ""))
+
+    return {
+        "has_club": True,
+        "club_name": club.name,
+        "plan_type": plan,
+        "billing_cycle": cycle,
+        "subscription_status": sub_status,
+        "member_count": member_count,
+        "max_members": max_members,
+        "calculated_price_eur": calculated_price,
+        "trial_ends_at": feat.get("trial_ends_at"),
+        "next_billing_date": feat.get("next_billing_date"),
+        "sepa_iban": "FI21 1234 5600 0007 85",
+        "sepa_bic": "NDEAFIHH",
+        "viitenumero": viitenumero,
+    }
 
 
 # ================= PRESIDENT & MEMBER CLUB BRANDING SYNC =================
