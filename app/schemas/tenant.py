@@ -1,21 +1,40 @@
 # chatup/backend/app/schemas/tenant.py
 import uuid
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from datetime import datetime
 
+
 class ClubFeatures(BaseModel):
+    model_config = ConfigDict(extra="allow")
     video_calls: bool = True
     mom_editor: bool = True
     social_feed: bool = True
     dues_module: bool = True
     max_members: int = 50
+    plan_type: Optional[str] = "CLUB_EXECUTIVE"
+    billing_cycle: Optional[str] = "YEARLY"
+    subscription_status: Optional[str] = "TRIAL"
+    trial_ends_at: Optional[str] = None
+    next_billing_date: Optional[str] = None
+    custom_price_eur: Optional[float] = None
+
+
+class ClubSubscriptionUpdate(BaseModel):
+    plan_type: str
+    billing_cycle: str
+    subscription_status: str
+    max_members: int = 50
+    trial_days: Optional[int] = 60
+    custom_price_eur: Optional[float] = None
+
 
 class CredentialsInfo(BaseModel):
     club_name: str
     president_name: str
     email: str
     temp_password: str
+
 
 class ClubPresidentInfo(BaseModel):
     id: uuid.UUID
@@ -26,6 +45,7 @@ class ClubPresidentInfo(BaseModel):
 
     class Config:
         from_attributes = True
+
 
 class ClubGovernorInfo(BaseModel):
     id: uuid.UUID
@@ -38,6 +58,7 @@ class ClubGovernorInfo(BaseModel):
     class Config:
         from_attributes = True
 
+
 class ClubOfficeBearerInfo(BaseModel):
     id: uuid.UUID
     full_name: str
@@ -49,10 +70,12 @@ class ClubOfficeBearerInfo(BaseModel):
     class Config:
         from_attributes = True
 
+
 class ClubPresidentUpdate(BaseModel):
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None
     phone_number: Optional[str] = None
+
 
 class ClubCreateRequest(BaseModel):
     name: str
@@ -63,10 +86,12 @@ class ClubCreateRequest(BaseModel):
     president_email: Optional[EmailStr] = None
     president_phone: Optional[str] = None
 
+
 class ClubUpdateRequest(BaseModel):
     name: Optional[str] = None
     district: Optional[str] = None
     is_active: Optional[bool] = None
+
 
 class ClubResponse(BaseModel):
     id: uuid.UUID
@@ -85,29 +110,6 @@ class ClubResponse(BaseModel):
     class Config:
         from_attributes = True
 
-class DistrictClubRosterResponse(BaseModel):
-    id: uuid.UUID
-    name: str
-    slug: str
-    district: Optional[str] = None
-    is_active: bool
-    member_count: int = 0
-    president: Optional[ClubPresidentInfo] = None
-    office_bearers: List[ClubOfficeBearerInfo] = []
-    features: Dict[str, Any] = {}
-
-    class Config:
-        from_attributes = True
-
-class AssignPresidentRequest(BaseModel):
-    full_name: str
-    email: EmailStr
-    phone_number: Optional[str] = None
-
-class AssignPresidentResponse(BaseModel):
-    message: str
-    credentials: CredentialsInfo
-
 
 class DistrictClubRosterResponse(BaseModel):
     id: uuid.UUID
@@ -123,3 +125,14 @@ class DistrictClubRosterResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AssignPresidentRequest(BaseModel):
+    full_name: str
+    email: EmailStr
+    phone_number: Optional[str] = None
+
+
+class AssignPresidentResponse(BaseModel):
+    message: str
+    credentials: CredentialsInfo

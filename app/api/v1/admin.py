@@ -1,7 +1,7 @@
 # chatup/backend/app/api/v1/admin.py
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 from pydantic import BaseModel, EmailStr
 from fastapi import (
@@ -30,6 +30,7 @@ from app.schemas.tenant import (
     ClubUpdateRequest,
     ClubResponse,
     ClubFeatures,
+    ClubSubscriptionUpdate,
     CredentialsInfo,
     ClubPresidentInfo,
     ClubGovernorInfo,
@@ -49,6 +50,32 @@ def extract_district_code(district_str: Optional[str]) -> str:
         return match.group(1).upper()
     clean = re.sub(r"\(.*?\)", "", district_str)
     return clean.replace("Lions", "").replace("District", "").strip().lower()
+
+
+def calculate_club_annual_value(features: dict, member_count: int) -> float:
+    """Calculates annualized revenue (ARR) contribution in EUR for a club workspace."""
+    if not features:
+        return 0.0
+    status_val = features.get("subscription_status", "TRIAL")
+    if status_val not in ["ACTIVE", "PAST_DUE"]:
+        return 0.0
+    if features.get("custom_price_eur") is not None:
+        base = float(features["custom_price_eur"])
+        return base * 12 if features.get("billing_cycle") == "MONTHLY" else base
+
+    plan = features.get("plan_type", "CLUB_EXECUTIVE")
+    cycle = features.get("billing_cycle", "YEARLY")
+    seats = max(5, member_count)
+
+    if plan == "FLEX_PER_PERSON":
+        return seats * 19.0 if cycle == "YEARLY" else seats * 1.90 * 12
+    elif plan == "CLUB_EXECUTIVE":
+        return 490.0 if cycle == "YEARLY" else 49.0 * 12
+    elif plan == "ASSOCIATION_PRO":
+        return 790.0 if cycle == "YEARLY" else 79.0 * 12
+    elif plan == "DISTRICT_BUNDLE":
+        return 320.0
+    return 490.0
 
 
 async def verify_super_admin(current_user: User = Depends(get_current_user)) -> User:
@@ -147,6 +174,26 @@ async def get_platform_telemetry(
         await db.execute(select(func.count(User.id)).where(User.role == UserRole.DISTRICT_GOVERNOR))
     ).scalar_one() or 0
 
+    # Calculate ARR & subscription counts across all workspaces
+    all_tenants = (await db.execute(select(Tenant))).scalars().all()
+    counts_res = await db.execute(
+        select(User.tenant_id, func.count(User.id)).group_by(User.tenant_id)
+    )
+    counts_map = dict(counts_res.all())
+
+    estimated_arr_eur = 0.0
+    trial_clubs = 0
+    paid_clubs = 0
+
+    for t in all_tenants:
+        f = t.features or {}
+        st = f.get("subscription_status", "TRIAL")
+        if st == "TRIAL":
+            trial_clubs += 1
+        elif st == "ACTIVE":
+            paid_clubs += 1
+        estimated_arr_eur += calculate_club_annual_value(f, counts_map.get(t.id, 0))
+
     return {
         "total_clubs": total_clubs,
         "active_clubs": active_clubs,
@@ -154,6 +201,9 @@ async def get_platform_telemetry(
         "total_members": total_members,
         "total_presidents": total_presidents,
         "total_governors": total_governors,
+        "estimated_arr_eur": round(estimated_arr_eur, 2),
+        "trial_clubs": trial_clubs,
+        "paid_clubs": paid_clubs,
         "subscription_health": "100%",
         "system_status": "Healthy",
     }
@@ -455,19 +505,35 @@ async def create_new_club(
         )
 
     now = datetime.utcnow().replace(tzinfo=None)
+    trial_end = (now + timedelta(days=60)).isoformat()
+
+    default_features = {
+        "video_calls": True,
+        "mom_editor": True,
+        "social_feed": True,
+        "dues_module": True,
+        "max_members": 75,
+        "plan_type": "CLUB_EXECUTIVE",
+        "billing_cycle": "YEARLY",
+        "subscription_status": "TRIAL",
+        "trial_ends_at": trial_end,
+    }
+
+    features_data = club_in.features.model_dump() if club_in.features else default_features
+    if not features_data.get("trial_ends_at"):
+        features_data["trial_ends_at"] = trial_end
+    if not features_data.get("plan_type"):
+        features_data["plan_type"] = "CLUB_EXECUTIVE"
+    if not features_data.get("billing_cycle"):
+        features_data["billing_cycle"] = "YEARLY"
+    if not features_data.get("subscription_status"):
+        features_data["subscription_status"] = "TRIAL"
+
     new_club = Tenant(
         name=club_in.name,
         slug=club_in.slug,
         district=club_in.district,
-        features=club_in.features.model_dump()
-        if club_in.features
-        else {
-            "video_calls": True,
-            "mom_editor": True,
-            "social_feed": True,
-            "dues_module": True,
-            "max_members": 50,
-        },
+        features=features_data,
         theme_config={
             "primary_color": "#002F6C",
             "secondary_color": "#F2A900",
@@ -653,7 +719,12 @@ async def update_club_features(
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
 
-    club.features = features_in.model_dump()
+    # Preserve existing subscription metadata while updating module switches
+    existing = dict(club.features or {})
+    incoming = features_in.model_dump(exclude_none=True)
+    existing.update(incoming)
+
+    club.features = existing
     flag_modified(club, "features")
     club.updated_at = datetime.utcnow().replace(tzinfo=None)
     await db.commit()
@@ -683,6 +754,50 @@ async def update_club_features(
         president=ClubPresidentInfo.model_validate(pres) if pres else None,
         governor=None,
     )
+
+
+# ================= SAAS SUBSCRIPTION & HYBRID BILLING MANAGER =================
+@router.patch("/clubs/{club_id}/subscription")
+async def update_club_subscription(
+    club_id: uuid.UUID,
+    payload: ClubSubscriptionUpdate,
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Configures Hybrid SaaS Plan (Flex Per-Person / Flat Monthly & Yearly / District Bundle) for a club."""
+    club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club workspace not found")
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    current_features = dict(club.features or {})
+
+    current_features["plan_type"] = payload.plan_type
+    current_features["billing_cycle"] = payload.billing_cycle
+    current_features["subscription_status"] = payload.subscription_status
+    current_features["max_members"] = payload.max_members
+
+    if payload.custom_price_eur is not None:
+        current_features["custom_price_eur"] = payload.custom_price_eur
+    else:
+        current_features.pop("custom_price_eur", None)
+
+    if payload.subscription_status == "TRIAL":
+        days = payload.trial_days if payload.trial_days is not None else 60
+        current_features["trial_ends_at"] = (now + timedelta(days=days)).isoformat()
+    elif payload.subscription_status == "ACTIVE":
+        cycle_days = 365 if payload.billing_cycle == "YEARLY" else 30
+        current_features["next_billing_date"] = (now + timedelta(days=cycle_days)).isoformat()
+
+    club.features = current_features
+    flag_modified(club, "features")
+    club.updated_at = now
+
+    await db.commit()
+    await db.refresh(club)
+    await notify_platform()
+
+    return {"status": "success", "features": club.features}
 
 
 # ================= CLUB BRANDING & CREST LOGO MANAGEMENT (SUPER ADMIN & GOVERNOR) =================
