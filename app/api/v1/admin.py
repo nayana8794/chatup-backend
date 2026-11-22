@@ -174,7 +174,6 @@ async def get_platform_telemetry(
         await db.execute(select(func.count(User.id)).where(User.role == UserRole.DISTRICT_GOVERNOR))
     ).scalar_one() or 0
 
-    # Calculate ARR & subscription counts across all workspaces
     all_tenants = (await db.execute(select(Tenant))).scalars().all()
     counts_res = await db.execute(
         select(User.tenant_id, func.count(User.id)).group_by(User.tenant_id)
@@ -241,6 +240,9 @@ async def list_district_governors(
         g_total_members = 0
 
         for c in all_clubs:
+            c_org = (c.features or {}).get("org_type", "LIONS")
+            if c_org == "STANDALONE":
+                continue
             c_code = extract_district_code(c.district)
             if (g_code and c_code and g_code == c_code) or (c.district == g.district):
                 m_count = counts_map.get(c.id, 0)
@@ -454,22 +456,24 @@ async def list_all_clubs(
                 is_active=pres.is_active,
             )
 
-        tenant_dist_code = extract_district_code(tenant.district)
+        org_type = (tenant.features or {}).get("org_type", "LIONS")
         gov_info = None
-        for g in governors:
-            g_dist_code = extract_district_code(g.district)
-            if (tenant_dist_code and g_dist_code and tenant_dist_code == g_dist_code) or (
-                tenant.district and g.district and tenant.district == g.district
-            ):
-                gov_info = ClubGovernorInfo(
-                    id=g.id,
-                    full_name=g.full_name,
-                    email=g.email,
-                    phone_number=g.phone_number,
-                    district=g.district,
-                    is_active=g.is_active,
-                )
-                break
+        if org_type != "STANDALONE":
+            tenant_dist_code = extract_district_code(tenant.district)
+            for g in governors:
+                g_dist_code = extract_district_code(g.district)
+                if (tenant_dist_code and g_dist_code and tenant_dist_code == g_dist_code) or (
+                    tenant.district and g.district and tenant.district == g.district
+                ):
+                    gov_info = ClubGovernorInfo(
+                        id=g.id,
+                        full_name=g.full_name,
+                        email=g.email,
+                        phone_number=g.phone_number,
+                        district=g.district,
+                        is_active=g.is_active,
+                    )
+                    break
 
         clubs_data.append(
             ClubResponse(
@@ -504,6 +508,17 @@ async def create_new_club(
             detail=f"Club workspace with identifier '{club_in.slug}' already exists",
         )
 
+    # Validate optional 1-step President email before creating workspace
+    if club_in.president_email:
+        existing_user = (
+            await db.execute(select(User).where(User.email == club_in.president_email.lower().strip()))
+        ).scalar_one_or_none()
+        if existing_user:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A user with email '{club_in.president_email}' is already registered",
+            )
+
     now = datetime.utcnow().replace(tzinfo=None)
     trial_end = (now + timedelta(days=60)).isoformat()
 
@@ -513,6 +528,8 @@ async def create_new_club(
         "social_feed": True,
         "dues_module": True,
         "max_members": 75,
+        "org_type": "LIONS",
+        "organization_header": None,
         "plan_type": "CLUB_EXECUTIVE",
         "billing_cycle": "YEARLY",
         "subscription_status": "TRIAL",
@@ -528,11 +545,18 @@ async def create_new_club(
         features_data["billing_cycle"] = "YEARLY"
     if not features_data.get("subscription_status"):
         features_data["subscription_status"] = "TRIAL"
+    if not features_data.get("org_type"):
+        features_data["org_type"] = "LIONS"
+
+    org_type = features_data.get("org_type", "LIONS")
+    resolved_district = club_in.district
+    if org_type == "STANDALONE" and not resolved_district:
+        resolved_district = "Independent Association"
 
     new_club = Tenant(
-        name=club_in.name,
-        slug=club_in.slug,
-        district=club_in.district,
+        name=club_in.name.strip(),
+        slug=club_in.slug.lower().strip(),
+        district=resolved_district,
         features=features_data,
         theme_config={
             "primary_color": "#002F6C",
@@ -543,9 +567,42 @@ async def create_new_club(
         updated_at=now,
     )
     db.add(new_club)
+    await db.flush()
+
+    pres_info = None
+    creds_info = None
+    m_count = 0
+
+    # 1-Step Inaugural President Creation (for Standalone or Direct Provisioning)
+    if club_in.president_name and club_in.president_email:
+        temp_pwd = generate_temporary_password()
+        president = User(
+            id=uuid.uuid4(),
+            tenant_id=new_club.id,
+            full_name=club_in.president_name.strip(),
+            email=club_in.president_email.lower().strip(),
+            phone_number=club_in.president_phone.strip() if club_in.president_phone else None,
+            hashed_password=get_password_hash(temp_pwd),
+            role=UserRole.PRESIDENT,
+            district=resolved_district,
+            is_active=True,
+            must_change_password=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(president)
+        await db.flush()
+        m_count = 1
+        pres_info = ClubPresidentInfo.model_validate(president)
+        creds_info = CredentialsInfo(
+            club_name=new_club.name,
+            president_name=president.full_name,
+            email=president.email,
+            temp_password=temp_pwd,
+        )
+
     await db.commit()
     await db.refresh(new_club)
-
     await notify_platform()
 
     return ClubResponse(
@@ -557,10 +614,10 @@ async def create_new_club(
         features=new_club.features or {},
         theme_config=new_club.theme_config or {},
         created_at=new_club.created_at,
-        member_count=0,
-        president=None,
+        member_count=m_count,
+        president=pres_info,
         governor=None,
-        credentials=None,
+        credentials=creds_info,
     )
 
 
@@ -719,7 +776,6 @@ async def update_club_features(
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
 
-    # Preserve existing subscription metadata while updating module switches
     existing = dict(club.features or {})
     incoming = features_in.model_dump(exclude_none=True)
     existing.update(incoming)

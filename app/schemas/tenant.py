@@ -1,7 +1,7 @@
 # chatup/backend/app/schemas/tenant.py
 import uuid
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, EmailStr, ConfigDict
+from pydantic import BaseModel, EmailStr, ConfigDict, field_validator
 from datetime import datetime
 
 
@@ -12,6 +12,8 @@ class ClubFeatures(BaseModel):
     social_feed: bool = True
     dues_module: bool = True
     max_members: int = 50
+    org_type: Optional[str] = "LIONS"  # STANDALONE | LIONS | ROTARY | FEDERATION
+    organization_header: Optional[str] = None
     plan_type: Optional[str] = "CLUB_EXECUTIVE"
     billing_cycle: Optional[str] = "YEARLY"
     subscription_status: Optional[str] = "TRIAL"
@@ -85,6 +87,13 @@ class ClubCreateRequest(BaseModel):
     president_name: Optional[str] = None
     president_email: Optional[EmailStr] = None
     president_phone: Optional[str] = None
+
+    @field_validator("president_email", "president_name", "president_phone", "district", mode="before")
+    @classmethod
+    def empty_str_to_none(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 
 class ClubUpdateRequest(BaseModel):

@@ -46,36 +46,46 @@ class MyClubBrandingUpdate(BaseModel):
     secondary_color: Optional[str] = None
 
 
-class DigitalMembershipCardResponse(BaseModel):
-    member_id: str
-    full_name: str
-    email: str
-    phone_number: Optional[str] = None
-    role: str
-    club_name: str
-    club_slug: str
-    district: str
-    joined_date: str
-    dues_standing: str
-    qr_payload: str
-    card_serial: str
-
-
 class MemberVerificationResult(BaseModel):
     is_valid: bool
     full_name: str
     role: str
     club_name: str
     district: str
+    organization_header: str
+    club_logo: Optional[str] = None
     member_since: str
     dues_standing: str
     verified_at: str
 
 
-def generate_friendly_temp_password() -> str:
+def generate_friendly_temp_password(org_type: Optional[str] = "LIONS") -> str:
     chars = string.ascii_letters + string.digits
     random_str = "".join(secrets.choice(chars) for _ in range(6))
-    return f"Lions@{random_str}"
+    prefix = "Lions" if org_type == "LIONS" else "Rotary" if org_type == "ROTARY" else "Club"
+    return f"{prefix}@{random_str}"
+
+
+def resolve_organization_header(club: Optional[Tenant]) -> tuple[str, str]:
+    """Returns (organization_header, serial_prefix) dynamically based on club org_type."""
+    if not club:
+        return ("OFFICIAL COMMUNITY ASSOCIATION", "CLUB")
+    feat = club.features or {}
+    custom_header = feat.get("organization_header")
+    org_type = feat.get("org_type", "LIONS")
+
+    if custom_header:
+        prefix = "LIONS" if org_type == "LIONS" else "ROTARY" if org_type == "ROTARY" else "CLUB"
+        return (str(custom_header).upper(), prefix)
+
+    if org_type == "LIONS":
+        return ("LIONS CLUBS INTERNATIONAL", "LIONS")
+    elif org_type == "ROTARY":
+        return ("ROTARY INTERNATIONAL", "ROTARY")
+    elif org_type == "FEDERATION":
+        return (club.district.upper() if club.district else "OFFICIAL FEDERATION MEMBER", "FED")
+    else:
+        return ("OFFICIAL ASSOCIATION CREDENTIAL", "CLUB")
 
 
 def generate_qr_signature(user_id: str, tenant_id: str) -> str:
@@ -112,11 +122,15 @@ async def create_member(
         )
 
     tenant_id = president.tenant_id
+    club = None
     if not tenant_id and president.role == UserRole.SUPER_ADMIN:
-        first_tenant = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
-        tenant_id = first_tenant.id if first_tenant else None
+        club = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
+        tenant_id = club.id if club else None
+    elif tenant_id:
+        club = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
 
-    temp_password = generate_friendly_temp_password()
+    org_type = (club.features or {}).get("org_type", "LIONS") if club else "CLUB"
+    temp_password = generate_friendly_temp_password(org_type)
     hashed_pass = get_password_hash(temp_password)
 
     new_member = User(
@@ -223,7 +237,12 @@ async def reset_member_password(
     if not member:
         raise HTTPException(status_code=404, detail="Member account not found")
 
-    temp_password = generate_friendly_temp_password()
+    club = None
+    if member.tenant_id:
+        club = (await db.execute(select(Tenant).where(Tenant.id == member.tenant_id))).scalar_one_or_none()
+    org_type = (club.features or {}).get("org_type", "LIONS") if club else "CLUB"
+
+    temp_password = generate_friendly_temp_password(org_type)
     member.hashed_password = get_password_hash(temp_password)
     member.must_change_password = True
 
@@ -330,17 +349,24 @@ async def get_my_club_branding(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns active branding configuration (colors & logo URL) for the authenticated member's club."""
+    """Returns active branding configuration, org_type, and club_name for white-label UI and letterheads."""
     if not current_user.tenant_id:
-        return {"theme_config": {}}
+        return {"theme_config": {}, "club_name": None, "org_type": "STANDALONE"}
 
     club = (
         await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
     ).scalar_one_or_none()
     if not club:
-        return {"theme_config": {}}
+        return {"theme_config": {}, "club_name": None, "org_type": "STANDALONE"}
 
-    return {"theme_config": club.theme_config or {}}
+    org_header, _ = resolve_organization_header(club)
+    return {
+        "theme_config": club.theme_config or {},
+        "club_name": club.name,
+        "district": club.district,
+        "org_type": (club.features or {}).get("org_type", "LIONS"),
+        "organization_header": org_header,
+    }
 
 
 @router.patch("/my-club/branding")
@@ -419,13 +445,13 @@ async def upload_my_club_crest(
     return {"status": "success", "logo_url": logo_url, "theme_config": club.theme_config}
 
 
-# ================= DIGITAL MEMBERSHIP CARD & QR VERIFICATION =================
+# ================= WHITE-LABEL DIGITAL MEMBERSHIP CARD & QR VERIFICATION =================
 @router.get("/me/digital-card")
 async def get_my_digital_membership_card(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves digital wallet membership card with 100% crash-proof fallbacks."""
+    """Retrieves digital wallet membership card with white-label organization parameters."""
     try:
         tenant_id = current_user.tenant_id
         club = None
@@ -437,13 +463,18 @@ async def get_my_digital_membership_card(
         if not club:
             club = (await db.execute(select(Tenant).limit(1))).scalar_one_or_none()
 
-        club_name = club.name if club else "Lions Community Club"
-        club_slug = club.slug if club else "lions-club"
+        club_name = club.name if club else "Community Association"
+        club_slug = club.slug if club else "club"
         district = (
             (club.district if club and club.district else current_user.district)
-            or "District 107-N"
+            or "Independent Association"
         )
         club_id_str = str(club.id) if club else str(uuid.uuid4())
+
+        org_header, serial_prefix = resolve_organization_header(club)
+        club_logo = (club.theme_config or {}).get("logo_url") if club else None
+        primary_color = (club.theme_config or {}).get("primary_color", "#002F6C") if club else "#002F6C"
+        secondary_color = (club.theme_config or {}).get("secondary_color", "#F2A900") if club else "#F2A900"
 
         dues_standing = "PAID"
         try:
@@ -462,7 +493,7 @@ async def get_my_digital_membership_card(
             dues_standing = "PAID"
 
         sig = generate_qr_signature(str(current_user.id), club_id_str)
-        card_serial = f"LIONS-{str(current_user.id)[:8].upper()}"
+        card_serial = f"{serial_prefix}-{str(current_user.id)[:8].upper()}"
         verification_url = f"https://chatup-frontend-steel.vercel.app/verify-member?uid={current_user.id}&tid={club_id_str}&sig={sig}"
 
         role_str = (
@@ -487,6 +518,10 @@ async def get_my_digital_membership_card(
             "club_name": club_name,
             "club_slug": club_slug,
             "district": district,
+            "organization_header": org_header,
+            "club_logo": club_logo,
+            "primary_color": primary_color,
+            "secondary_color": secondary_color,
             "joined_date": joined_iso,
             "dues_standing": dues_standing,
             "qr_payload": verification_url,
@@ -546,13 +581,17 @@ async def verify_member_credentials(
     )
 
     role_str = user.role.value if hasattr(user.role, "value") else str(user.role)
+    org_header, _ = resolve_organization_header(club)
+    club_logo = (club.theme_config or {}).get("logo_url")
 
     return MemberVerificationResult(
         is_valid=user.is_active,
         full_name=user.full_name,
         role=role_str,
         club_name=club.name,
-        district=club.district or "District 107-N",
+        district=club.district or "Independent Association",
+        organization_header=org_header,
+        club_logo=club_logo,
         member_since=member_since,
         dues_standing=dues_standing,
         verified_at=now_utc,
