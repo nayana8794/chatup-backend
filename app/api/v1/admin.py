@@ -52,8 +52,27 @@ def extract_district_code(district_str: Optional[str]) -> str:
     return clean.replace("Lions", "").replace("District", "").strip().lower()
 
 
+class PlatformPricingSettings(BaseModel):
+    per_member_monthly_eur: float = 0.86
+    per_member_yearly_eur: float = 8.60
+    club_executive_monthly_eur: float = 49.0
+    club_executive_yearly_eur: float = 490.0
+    association_pro_monthly_eur: float = 79.0
+    association_pro_yearly_eur: float = 790.0
+    district_bundle_yearly_eur: float = 320.0
+    default_trial_days: int = 60
+    default_member_quota: int = 75
+    sepa_iban: str = "FI21 1234 5600 0007 85"
+    sepa_bic: str = "NDEAFIHH"
+    platform_currency: str = "EUR"
+
+
+# In-memory platform settings initialized with defaults
+global_platform_settings = PlatformPricingSettings()
+
+
 def calculate_club_annual_value(features: dict, member_count: int) -> float:
-    """Calculates annualized revenue (ARR) contribution in EUR for a club workspace."""
+    """Calculates annualized revenue (ARR) contribution in EUR using dynamic platform pricing."""
     if not features:
         return 0.0
     status_val = features.get("subscription_status", "TRIAL")
@@ -68,14 +87,14 @@ def calculate_club_annual_value(features: dict, member_count: int) -> float:
     seats = max(5, member_count)
 
     if plan == "FLEX_PER_PERSON":
-        return seats * 19.0 if cycle == "YEARLY" else seats * 1.90 * 12
+        return seats * global_platform_settings.per_member_yearly_eur if cycle == "YEARLY" else seats * global_platform_settings.per_member_monthly_eur * 12
     elif plan == "CLUB_EXECUTIVE":
-        return 490.0 if cycle == "YEARLY" else 49.0 * 12
+        return global_platform_settings.club_executive_yearly_eur if cycle == "YEARLY" else global_platform_settings.club_executive_monthly_eur * 12
     elif plan == "ASSOCIATION_PRO":
-        return 790.0 if cycle == "YEARLY" else 79.0 * 12
+        return global_platform_settings.association_pro_yearly_eur if cycle == "YEARLY" else global_platform_settings.association_pro_monthly_eur * 12
     elif plan == "DISTRICT_BUNDLE":
-        return 320.0
-    return 490.0
+        return global_platform_settings.district_bundle_yearly_eur
+    return global_platform_settings.club_executive_yearly_eur
 
 
 async def verify_super_admin(current_user: User = Depends(get_current_user)) -> User:
@@ -143,6 +162,27 @@ class ClubBrandingUpdate(BaseModel):
     primary_color: Optional[str] = "#002F6C"
     secondary_color: Optional[str] = "#F2A900"
     logo_url: Optional[str] = None
+
+
+# ================= GLOBAL PLATFORM PRICING SETTINGS =================
+@router.get("/pricing-config", response_model=PlatformPricingSettings)
+async def get_platform_pricing_settings(
+    _: User = Depends(verify_super_admin),
+):
+    """Retrieves global SaaS subscription pricing and billing defaults."""
+    return global_platform_settings
+
+
+@router.put("/pricing-config", response_model=PlatformPricingSettings)
+async def update_platform_pricing_settings(
+    payload: PlatformPricingSettings,
+    _: User = Depends(verify_super_admin),
+):
+    """Updates global platform pricing and syncs live across all subscription calculators."""
+    global global_platform_settings
+    global_platform_settings = payload
+    await notify_platform()
+    return global_platform_settings
 
 
 @router.get("/stats")
@@ -508,7 +548,6 @@ async def create_new_club(
             detail=f"Club workspace with identifier '{club_in.slug}' already exists",
         )
 
-    # Validate optional 1-step President email before creating workspace
     if club_in.president_email:
         existing_user = (
             await db.execute(select(User).where(User.email == club_in.president_email.lower().strip()))
@@ -520,14 +559,14 @@ async def create_new_club(
             )
 
     now = datetime.utcnow().replace(tzinfo=None)
-    trial_end = (now + timedelta(days=60)).isoformat()
+    trial_end = (now + timedelta(days=global_platform_settings.default_trial_days)).isoformat()
 
     default_features = {
         "video_calls": True,
         "mom_editor": True,
         "social_feed": True,
         "dues_module": True,
-        "max_members": 75,
+        "max_members": global_platform_settings.default_member_quota,
         "org_type": "LIONS",
         "organization_header": None,
         "plan_type": "CLUB_EXECUTIVE",
@@ -573,7 +612,6 @@ async def create_new_club(
     creds_info = None
     m_count = 0
 
-    # 1-Step Inaugural President Creation (for Standalone or Direct Provisioning)
     if club_in.president_name and club_in.president_email:
         temp_pwd = generate_temporary_password()
         president = User(
@@ -839,7 +877,7 @@ async def update_club_subscription(
         current_features.pop("custom_price_eur", None)
 
     if payload.subscription_status == "TRIAL":
-        days = payload.trial_days if payload.trial_days is not None else 60
+        days = payload.trial_days if payload.trial_days is not None else global_platform_settings.default_trial_days
         current_features["trial_ends_at"] = (now + timedelta(days=days)).isoformat()
     elif payload.subscription_status == "ACTIVE":
         cycle_days = 365 if payload.billing_cycle == "YEARLY" else 30
