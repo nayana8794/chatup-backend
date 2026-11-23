@@ -28,6 +28,7 @@ from app.schemas.member import (
     MemberResponse,
     MemberCreatedWithTempPass,
 )
+from app.api.v1.admin import global_platform_settings
 
 logger = logging.getLogger("uvicorn.error")
 router = APIRouter(prefix="/members", tags=["Member Management"])
@@ -293,7 +294,7 @@ async def get_my_club_subscription(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns active subscription tier, calculated seat/flat price, and SEPA payment reference for the club."""
+    """Returns active subscription tier, dynamic setup fee, calculated price, and SEPA reference."""
     if not current_user.tenant_id:
         return {"has_club": False}
 
@@ -316,14 +317,19 @@ async def get_my_club_subscription(
     if custom_price is not None:
         calculated_price = float(custom_price)
     elif plan == "FLEX_PER_PERSON":
-        calculated_price = round(seats * (19.0 if cycle == "YEARLY" else 1.90), 2)
+        calculated_price = round(seats * (global_platform_settings.per_member_yearly_eur if cycle == "YEARLY" else global_platform_settings.per_member_monthly_eur), 2)
     elif plan == "ASSOCIATION_PRO":
-        calculated_price = 790.0 if cycle == "YEARLY" else 79.0
+        calculated_price = global_platform_settings.association_pro_yearly_eur if cycle == "YEARLY" else global_platform_settings.association_pro_monthly_eur
     elif plan == "DISTRICT_BUNDLE":
-        calculated_price = 320.0
+        calculated_price = global_platform_settings.district_bundle_yearly_eur
     else:
-        calculated_price = 490.0 if cycle == "YEARLY" else 49.0
+        calculated_price = global_platform_settings.club_executive_yearly_eur if cycle == "YEARLY" else global_platform_settings.club_executive_monthly_eur
 
+    setup_fee = global_platform_settings.one_time_setup_fee_eur
+    if global_platform_settings.waive_setup_fee_on_yearly and cycle == "YEARLY":
+        setup_fee = 0.0
+
+    total_with_setup = calculated_price + setup_fee
     viitenumero = generate_finnish_viitenumero(str(club.id).replace("-", ""))
 
     return {
@@ -335,10 +341,12 @@ async def get_my_club_subscription(
         "member_count": member_count,
         "max_members": max_members,
         "calculated_price_eur": calculated_price,
+        "setup_fee_eur": setup_fee,
+        "total_amount_eur": total_with_setup,
         "trial_ends_at": feat.get("trial_ends_at"),
         "next_billing_date": feat.get("next_billing_date"),
-        "sepa_iban": "FI21 1234 5600 0007 85",
-        "sepa_bic": "NDEAFIHH",
+        "sepa_iban": global_platform_settings.sepa_iban,
+        "sepa_bic": global_platform_settings.sepa_bic,
         "viitenumero": viitenumero,
     }
 

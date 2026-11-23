@@ -60,6 +60,8 @@ class PlatformPricingSettings(BaseModel):
     association_pro_monthly_eur: float = 79.0
     association_pro_yearly_eur: float = 790.0
     district_bundle_yearly_eur: float = 320.0
+    one_time_setup_fee_eur: float = 0.0          # 100% Dynamic from Admin Settings (No hardcoded values)
+    waive_setup_fee_on_yearly: bool = True       # Dynamic waiver switch
     default_trial_days: int = 60
     default_member_quota: int = 75
     sepa_iban: str = "FI21 1234 5600 0007 85"
