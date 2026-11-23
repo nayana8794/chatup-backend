@@ -4,14 +4,14 @@ from datetime import datetime
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.ws_manager import manager
 from app.models.user import User, UserRole
 from app.models.event_proposal import EventProposal, ProposalStatus
-from app.models.event import Event, EventType, RSVPStatus
+from app.models.event import Event, EventType
 from app.schemas.proposal import ProposalCreateRequest, ProposalResponse
 
 router = APIRouter(prefix="/proposals", tags=["Community Event Proposals"])
@@ -42,8 +42,7 @@ async def list_proposals(
         )
         result = await db.execute(query)
         return result.scalars().all()
-    except Exception as e:
-        # If table is just being created or empty
+    except Exception:
         return []
 
 
@@ -77,7 +76,11 @@ async def create_proposal(
     await db.commit()
     await db.refresh(proposal)
 
-    await notify_tenant(current_user.tenant_id, "EVENT_PROPOSAL_CREATED", {"proposal_id": str(proposal.id)})
+    await notify_tenant(
+        current_user.tenant_id,
+        "EVENT_PROPOSAL_CREATED",
+        {"proposal_id": str(proposal.id), "sender_id": str(current_user.id)},
+    )
     return proposal
 
 
@@ -106,7 +109,6 @@ async def endorse_proposal(
     endorsed_list.append(user_id_str)
     proposal.endorsed_user_ids = endorsed_list
 
-    # If at least 2 members endorse, automatically elevate to President approval queue
     if len(endorsed_list) >= 2 and proposal.status == ProposalStatus.PENDING_ENDORSEMENT:
         proposal.status = ProposalStatus.PENDING_PRESIDENT_APPROVAL
 
@@ -114,7 +116,11 @@ async def endorse_proposal(
     await db.commit()
     await db.refresh(proposal)
 
-    await notify_tenant(proposal.tenant_id, "EVENT_PROPOSAL_ENDORSED", {"proposal_id": str(proposal.id)})
+    await notify_tenant(
+        proposal.tenant_id,
+        "EVENT_PROPOSAL_ENDORSED",
+        {"proposal_id": str(proposal.id), "sender_id": str(current_user.id)},
+    )
     return proposal
 
 
@@ -125,7 +131,8 @@ async def approve_and_publish_proposal(
     db: AsyncSession = Depends(get_db),
 ):
     """President approves the proposal, officially converting it into a club event in the calendar."""
-    is_pres = ["SUPER_ADMIN", "PRESIDENT", "VICE_PRESIDENT"].includes(current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role))
+    role_str = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    is_pres = role_str in ["SUPER_ADMIN", "PRESIDENT", "VICE_PRESIDENT"]
     if not is_pres and current_user.role != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only Club President can approve event proposals.")
 
@@ -141,7 +148,6 @@ async def approve_and_publish_proposal(
     proposal.status = ProposalStatus.APPROVED_AND_PUBLISHED
     proposal.updated_at = datetime.utcnow().replace(tzinfo=None)
 
-    # Automatically create official club event in calendar
     new_event = Event(
         id=uuid.uuid4(),
         tenant_id=proposal.tenant_id,
@@ -160,8 +166,16 @@ async def approve_and_publish_proposal(
     await db.commit()
     await db.refresh(proposal)
 
-    await notify_tenant(proposal.tenant_id, "EVENT_CREATED", {"event_id": str(new_event.id)})
-    await notify_tenant(proposal.tenant_id, "EVENT_PROPOSAL_APPROVED", {"proposal_id": str(proposal.id)})
+    await notify_tenant(
+        proposal.tenant_id,
+        "EVENT_CREATED",
+        {"event_id": str(new_event.id), "sender_id": str(current_user.id)},
+    )
+    await notify_tenant(
+        proposal.tenant_id,
+        "EVENT_PROPOSAL_APPROVED",
+        {"proposal_id": str(proposal.id), "sender_id": str(current_user.id)},
+    )
     return proposal
 
 
@@ -178,7 +192,8 @@ async def delete_proposal(
     if not proposal:
         raise HTTPException(status_code=404, detail="Proposal not found")
 
-    is_pres = ["SUPER_ADMIN", "PRESIDENT", "VICE_PRESIDENT"].includes(current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role))
+    role_str = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    is_pres = role_str in ["SUPER_ADMIN", "PRESIDENT", "VICE_PRESIDENT"]
     if proposal.proposer_id != current_user.id and not is_pres:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -186,5 +201,9 @@ async def delete_proposal(
     await db.delete(proposal)
     await db.commit()
 
-    await notify_tenant(tenant_id, "EVENT_PROPOSAL_DELETED", {"proposal_id": str(proposal_id)})
+    await notify_tenant(
+        tenant_id,
+        "EVENT_PROPOSAL_DELETED",
+        {"proposal_id": str(proposal_id), "sender_id": str(current_user.id)},
+    )
     return {"message": "Proposal deleted"}
