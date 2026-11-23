@@ -10,6 +10,7 @@ from app.models.push_subscription import PushSubscription
 from app.models.poll import Poll, PollOption, PollVoter, PollType, PollStatus
 from app.models.document import ClubDocument, DocumentCategory
 from app.models.financial_sheet import FinancialSheet, SheetType, SheetStatus
+from app.models.event_proposal import EventProposal, ProposalStatus
 
 __all__ = [
     "Tenant",
@@ -44,7 +45,9 @@ __all__ = [
     "DocumentCategory",
     "FinancialSheet",
     "SheetType",
-    "SheetStatus"
+    "SheetStatus",
+    "EventProposal",
+    "ProposalStatus"
 
 
 ]
