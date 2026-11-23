@@ -6,8 +6,11 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
-from app.core.database import get_db
+from app.core.database import get_db, engine, Base
 from app.core.config import settings
+
+# Ensure models are imported so Base.metadata knows about them
+import app.models.event_proposal
 
 # Router Imports
 from app.api.v1.auth import router as auth_router
@@ -33,6 +36,12 @@ app = FastAPI(
     description="SaaS Backend for Community Clubs",
 )
 
+# Startup event to ensure event_proposals table exists in Neon PostgreSQL
+@app.on_event("startup")
+async def init_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
 # CORS configuration
 origins = [
     "http://localhost:5173",
@@ -49,7 +58,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static files mounting to serve uploaded photos publicly
+# Static files mounting
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(os.path.join(STATIC_DIR, "uploads"), exist_ok=True)

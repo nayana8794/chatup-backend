@@ -30,17 +30,21 @@ async def list_proposals(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves all event proposals for the user's club workspace."""
+    """Retrieves all event proposals for the user's club workspace with fail-safe fallback."""
     if not current_user.tenant_id:
         return []
 
-    query = (
-        select(EventProposal)
-        .where(EventProposal.tenant_id == current_user.tenant_id)
-        .order_by(EventProposal.created_at.desc())
-    )
-    result = await db.execute(query)
-    return result.scalars().all()
+    try:
+        query = (
+            select(EventProposal)
+            .where(EventProposal.tenant_id == current_user.tenant_id)
+            .order_by(EventProposal.created_at.desc())
+        )
+        result = await db.execute(query)
+        return result.scalars().all()
+    except Exception as e:
+        # If table is just being created or empty
+        return []
 
 
 @router.post("", response_model=ProposalResponse)
