@@ -60,8 +60,8 @@ class PlatformPricingSettings(BaseModel):
     association_pro_monthly_eur: float = 79.0
     association_pro_yearly_eur: float = 790.0
     district_bundle_yearly_eur: float = 320.0
-    one_time_setup_fee_eur: float = 0.0          # 100% Dynamic from Admin Settings (No hardcoded values)
-    waive_setup_fee_on_yearly: bool = True       # Dynamic waiver switch
+    one_time_setup_fee_eur: float = 0.0
+    waive_setup_fee_on_yearly: bool = True
     default_trial_days: int = 60
     default_member_quota: int = 75
     sepa_iban: str = "FI21 1234 5600 0007 85"
@@ -164,6 +164,12 @@ class ClubBrandingUpdate(BaseModel):
     primary_color: Optional[str] = "#002F6C"
     secondary_color: Optional[str] = "#F2A900"
     logo_url: Optional[str] = None
+
+
+class RecordClubPaymentRequest(BaseModel):
+    amount_eur: float
+    reference_number: Optional[str] = None
+    notes: Optional[str] = None
 
 
 # ================= GLOBAL PLATFORM PRICING SETTINGS =================
@@ -1053,3 +1059,69 @@ async def delete_club_workspace(
     await notify_platform()
 
     return {"status": "success", "message": f"Club workspace '{club.name}' successfully deleted"}
+
+
+@router.get("/clubs/{club_id}/billing-history")
+async def get_club_billing_history(
+    club_id: uuid.UUID,
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieves official subscription and payment history records for a specific club."""
+    club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club workspace not found")
+
+    feat = club.features or {}
+    history = feat.get("payment_history", [])
+
+    return {
+        "club_id": club.id,
+        "club_name": club.name,
+        "current_plan": feat.get("plan_type", "CLUB_EXECUTIVE"),
+        "billing_cycle": feat.get("billing_cycle", "YEARLY"),
+        "subscription_status": feat.get("subscription_status", "TRIAL"),
+        "payment_history": history,
+    }
+
+
+@router.post("/clubs/{club_id}/billing-history")
+async def record_club_payment(
+    club_id: uuid.UUID,
+    payload: RecordClubPaymentRequest,
+    _: User = Depends(verify_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Records a manual SEPA or card payment for a club and activates their license."""
+    club = (await db.execute(select(Tenant).where(Tenant.id == club_id))).scalar_one_or_none()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club workspace not found")
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    current_features = dict(club.features or {})
+    current_features["subscription_status"] = "ACTIVE"
+
+    cycle_days = 365 if current_features.get("billing_cycle", "YEARLY") == "YEARLY" else 30
+    current_features["next_billing_date"] = (now + timedelta(days=cycle_days)).isoformat()
+
+    history = list(current_features.get("payment_history", []))
+    new_record = {
+        "id": str(uuid.uuid4()),
+        "amount_eur": payload.amount_eur,
+        "reference_number": payload.reference_number or f"SEPA-{uuid.uuid4().hex[:8].upper()}",
+        "notes": payload.notes or "Manual SEPA Bank Transfer Reconciled",
+        "paid_at": now.isoformat(),
+        "status": "PAID",
+    }
+    history.insert(0, new_record)
+    current_features["payment_history"] = history
+
+    club.features = current_features
+    flag_modified(club, "features")
+    club.updated_at = now
+
+    await db.commit()
+    await db.refresh(club)
+    await notify_platform()
+
+    return {"status": "success", "message": "Payment recorded and license activated", "payment_record": new_record}
